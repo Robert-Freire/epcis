@@ -144,7 +144,7 @@ public class StressTestBenchmarks
     [Benchmark]
     public async Task<Request> CaptureVeryLargeXmlDocument()
     {
-        var xml = _largeXmlDocuments[10000];
+        var xml = _largeXmlDocuments[9999];
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes(xml));
         var request = await XmlCaptureRequestParser.ParseAsync(stream, CancellationToken.None);
         return await _captureHandler.StoreAsync(request, CancellationToken.None);
@@ -153,7 +153,7 @@ public class StressTestBenchmarks
     [Benchmark]
     public async Task<Request> CaptureVeryLargeJsonDocument()
     {
-        var json = _largeJsonDocuments[10000];
+        var json = _largeJsonDocuments[9999];
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
         var namespaces = new Namespaces(new Dictionary<string, string>());
         var request = await JsonCaptureRequestParser.ParseDocumentAsync(stream, namespaces, CancellationToken.None);
