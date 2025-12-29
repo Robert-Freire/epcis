@@ -67,7 +67,7 @@ public class LimitTestBenchmarks
     [Benchmark(Baseline = true)]
     public async Task<Request> CaptureAtMaxLimit()
     {
-        var request = _requests[500];
+        var request = _requests[499];
         return await _limitedCaptureHandler.StoreAsync(request, CancellationToken.None);
     }
 
