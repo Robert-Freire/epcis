@@ -22,3 +22,7 @@ obj
 *.db
 *.db-shm
 *.db-wal
+
+# BenchmarkDotNet files
+**/BenchmarkDotNet.Artifacts/*.log
+**/BenchmarkDotNet.Artifacts/results/*
