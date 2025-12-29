@@ -72,7 +72,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\FasTnT.Host\FasTnT.Host.csproj" />
+    <ProjectReference Include="..\..\src\Providers\FasTnT.Sqlite\FasTnT.Sqlite.csproj" />
+    <ProjectReference Include="..\FasTnT.Application.Tests\FasTnT.Application.Tests.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,0 +1,15 @@
+global using BenchmarkDotNet.Attributes;
+global using BenchmarkDotNet.Running;
+global using FasTnT.Application.Database;
+global using FasTnT.Application.Handlers;
+global using FasTnT.Application.Services.Notifications;
+global using FasTnT.Application.Services.Users;
+global using FasTnT.Domain.Model;
+global using FasTnT.Domain.Model.Events;
+global using FasTnT.Host.Communication.Json.Parsers;
+global using FasTnT.Host.Communication.Xml.Parsers;
+global using FasTnT.PerformanceTests.Config;
+global using FasTnT.PerformanceTests.Helpers;
+global using Microsoft.EntityFrameworkCore;
+global using Microsoft.Extensions.Options;
+global using System.Text;

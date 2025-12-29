@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FasTnT.Application\FasTnT.Application.csproj" />
+    <ProjectReference Include="..\..\src\FasTnT.Domain\FasTnT.Domain.csproj" />
+    <ProjectReference Include="..\..\src\FasTnT.Host\FasTnT.Host.csproj" />
+    <ProjectReference Include="..\..\src\Providers\FasTnT.Sqlite\FasTnT.Sqlite.csproj" />
+  </ItemGroup>
+
+</Project>
