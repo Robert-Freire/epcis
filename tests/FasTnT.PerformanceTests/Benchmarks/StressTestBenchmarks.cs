@@ -144,7 +144,7 @@ public class StressTestBenchmarks
     [Benchmark]
     public async Task<Request> CaptureVeryLargeXmlDocument()
     {
-        var xml = _largeXmlDocuments[9999];
+        var xml = _largeXmlDocuments[10000];
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes(xml));
         var request = await XmlCaptureRequestParser.ParseAsync(stream, CancellationToken.None);
         return await _captureHandler.StoreAsync(request, CancellationToken.None);
