@@ -202,7 +202,7 @@ Else:
 
 ---
 
-### Optional Phase 2B — Backfill Existing Data
+### Optional Phase 3 — Backfill Existing Data
 
 **Only pursue if:** Performance consistency needed for historical queries or legacy code retirement desired.
 
@@ -282,7 +282,7 @@ Query Logic:
 
 ---
 
-**Benefits (Phase 2B)**
+**Benefits (Phase 3)**
 - Uniform performance across all data (old and new)
 - Can retire legacy reconstruction code
 - Consistent query response times
@@ -304,7 +304,7 @@ Query Logic:
 
 ---
 
-### Optional Phase 3 — Streaming Ingestion (Stop Point C)
+### Optional Phase 4 — Streaming Ingestion (Stop Point D)
 
 **Only pursue if:** Phase 2 insufficient for extreme-scale documents (>500 MB) or memory constraints remain critical.
 
@@ -460,7 +460,7 @@ operational constraints, observed usage patterns, and compliance requirements.
 - No distributed transaction complexity or reconciliation jobs needed
 - Single backup strategy (SQL backup includes FILESTREAM)
 
-### Phase 3 Streaming Ingestion Validation Strategy
+### Phase 4 Streaming Ingestion Validation Strategy
 - Schema validation approach when using streaming XML parsing (`XmlReader` with schema validation)
 - Security constraints (entity expansion, depth limits, size limits) - need tighter controls with streaming
 - Performance impact of schema-validating reader vs. DOM validation
@@ -480,8 +480,8 @@ the phased migration strategy described in this document.
 Adopt a **Hybrid architecture with phased migration**:
 - **Phase 1 (2-3 weeks):** Algorithmic optimizations → 30-40% improvement
 - **Phase 2 (6-10 weeks):** SQL Server FILESTREAM dual blob storage with dual-read mode → 90% query improvement for new data (no capture improvement)
-- **Phase 2B (optional, 1-6 months):** Backfill existing data → uniform performance for all data, retire legacy code
-- **Phase 3 (optional, 4-6 weeks):** Streaming parser → 80-86% capture improvement
+- **Phase 3 (optional, 1-6 months):** Backfill existing data → uniform performance for all data, retire legacy code
+- **Phase 4 (optional, 4-6 weeks):** Streaming parser → 80-86% capture improvement
 
 **Storage Strategy:** SQL Server FILESTREAM (transactional, single platform, proven at scale)
 
@@ -496,7 +496,7 @@ This strategy:
 - Delivers major performance gains (Phase 2 sufficient for most workloads)
 - Uses existing SQL Server infrastructure (no new platforms)
 - Enables immediate deployment with graceful degradation (dual-read mode)
-- Makes backfilling truly optional (Phase 2B)
+- Makes backfilling truly optional (Phase 3)
 
 ---
 
