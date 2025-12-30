@@ -153,7 +153,7 @@ public class StressTestBenchmarks
     [Benchmark]
     public async Task<Request> CaptureVeryLargeJsonDocument()
     {
-        var json = _largeJsonDocuments[9999];
+        var json = _largeJsonDocuments[10000];
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
         var namespaces = new Namespaces(new Dictionary<string, string>());
         var request = await JsonCaptureRequestParser.ParseDocumentAsync(stream, namespaces, CancellationToken.None);
