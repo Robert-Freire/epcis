@@ -3,15 +3,16 @@
 
 ## Purpose
 
-This document refines the EPCIS performance proposal to explicitly preserve **query flexibility**
-by favoring a **Hybrid architecture** (normalized SQL + blob storage), combined with an **optional,
-phased introduction of asynchronous capture processing**.
+This document defines the EPCIS performance optimization strategy using a **Hybrid architecture**:
+- **Normalized SQL Server tables** for query flexibility (all EPCIS query parameters)
+- **SQL Server FILESTREAM blobs** for performance (dual granularity: per-event + per-capture)
+- **Phased implementation** with clear validation gates
 
 The intent is to:
-- Improve performance incrementally
-- Keep SQL-based querying as a first-class capability
+- Improve performance incrementally (2-3 month timeline for Phase 1+2)
+- Preserve full EPCIS query semantics (no loss of functionality)
 - Make trade-offs explicit at each stopping point
-- Allow the system to stop at intermediate phases if required
+- Enable production deployment after Phase 2 (sufficient for most workloads)
 
 This is a **design document**, not an implementation plan.
 
@@ -36,17 +37,22 @@ This is a **design document**, not an implementation plan.
 
 ---
 
-## Target Architecture: Hybrid (Normalized + Blob)
+## Target Architecture: SQL Server Hybrid (Tables + FILESTREAM)
 
 ### Core Idea
 
-The Hybrid approach combines:
-- **Normalized relational storage** for queryable EPCIS fields
-- **Raw EPCIS XML blobs** for fidelity-preserving responses
-- **Selective denormalization** for frequently queried custom fields
+The architecture combines SQL Server relational and FILESTREAM storage:
 
-This keeps SQL Server (or equivalent RDBMS) as the primary query engine,
-while eliminating the most expensive serialization paths.
+**SQL Server Tables (Normalized):**
+- All queryable EPCIS fields indexed
+- Supports all EPCIS query parameters
+- Full query flexibility preserved
+
+**SQL Server FILESTREAM (Dual Blob Storage):**
+- **Per-event blobs:** Individual XML fragments (~20 KB each) for selective queries
+- **Per-capture blobs:** Complete EPCIS documents (~400 MB) for compliance and bulk retrieval
+
+This keeps SQL Server as both the query engine AND blob storage platform (single platform, transactional consistency), while eliminating expensive recursive serialization.
 
 ---
 
@@ -54,29 +60,40 @@ while eliminating the most expensive serialization paths.
 
 ### Normalized Relational Data (SQL)
 
-Stored in SQL Server:
-- Event identifiers
+Stored in SQL Server tables:
+- Event identifiers (EventId, unique)
 - Temporal fields (eventTime, recordTime)
 - Core EPCIS dimensions (bizStep, disposition, readPoint, bizLocation)
-- Frequently queried custom fields (configurable subset)
+- Event metadata (type, action, transformationId)
+- References to FILESTREAM blobs (BlobId for per-event, CaptureId for per-capture)
 
 Purpose:
-- Preserve EPCIS query flexibility
-- Enable complex filters, joins, and pagination
+- Preserve full EPCIS query flexibility
+- Enable complex filters, joins, aggregations, and pagination
+- Support all EPCIS query parameters (100+ standard parameters)
 
 ---
 
-### Blob Storage
+### Blob Storage (SQL Server FILESTREAM)
 
-Stored externally (or as DB BLOB):
-- Original EPCIS XML payload, stored **per event** (compressed)
+Stored in SQL Server FILESTREAM (on NTFS, transactional):
+
+**Per-Event Blobs:**
+- Individual event XML fragments (~20 KB each, compressed)
+- Enables selective retrieval (query 10 events → fetch 10 blobs, not entire document)
+- Referenced via `Event.EventBlobId` foreign key
+
+**Per-Capture Blobs:**
+- Complete EPCIS document as originally submitted (~400 MB for 20,000 events, compressed)
+- Preserves document context (EPCIS Header, MasterData, original structure)
+- Referenced via `Request.DocumentBlobId` foreign key
+- Used for compliance exports, auditing, full-document retrieval
 
 Purpose:
-- Serve XML responses without reconstruction
+- Serve XML responses without reconstruction (eliminate O(n²) field formatting)
 - Preserve full EPCIS fidelity and extensions
-- Reduce CPU cost during queries
-
-Each persisted EPCIS event is associated with exactly one immutable blob payload via a SQL reference.
+- Reduce CPU cost during queries (~90% reduction)
+- Transactional consistency (FILESTREAM participates in SQL transactions)
 
 ---
 
@@ -84,14 +101,26 @@ Each persisted EPCIS event is associated with exactly one immutable blob payload
 
 | Query Type | Execution Path |
 |-----------|----------------|
-| Core EPCIS filters | SQL (normalized tables) |
-| Custom-field heavy queries | SQL + optional denormalized tables |
-| XML response generation | Blob retrieval |
-| JSON responses | Blob → transform (cached if needed) |
+| **Event filtering** (EQ_bizStep, GE_eventTime, etc.) | SQL query on normalized Event table |
+| **Result identification** | SQL returns list of EventIds matching criteria |
+| **XML response (small result sets <100 events)** | Fetch per-event blobs via FILESTREAM (10 events → 10 blob reads) |
+| **XML response (large result sets >100 events)** | Fetch per-capture blobs, stream response (1 blob read for entire capture) |
+| **JSON responses** | Fetch per-event XML blobs → transform to JSON (or cache JSON variant) |
+| **Compliance exports** | Fetch per-capture blob (original EPCIS document, unmodified) |
 
-Trade-off:
-- Slight increase in I/O cost for blob retrieval
-- Major reduction in CPU and memory usage
+**Query Optimizer Logic:**
+```
+If result_count < 100:
+    Fetch per-event blobs (selective)
+Else:
+    Fetch per-capture blob (bulk)
+```
+
+**Trade-off:**
+- Storage: +200-300% (dual blobs)
+- I/O: Slight increase for blob retrieval (streaming, not full load)
+- CPU: Major reduction (~90% less field reconstruction)
+- Memory: Major reduction (no in-memory object graphs for serialization)
 
 ---
 
@@ -100,9 +129,13 @@ Trade-off:
 ### Phase 1 — Low-Risk Optimizations (Stop Point A)
 
 **Changes**
-- Fix configuration and correctness issues
-- Remove O(n²) field reconstruction (algorithmic optimization to O(n) by pre-grouping by ParentId)
-- Reduce EF Core transaction overhead
+- Fix configuration bugs (`Constants.cs:6` - CaptureSizeLimit incorrectly set to 1 KB)
+- Remove O(n²) field reconstruction bottleneck:
+  - **Code:** `XmlEventFormatter.FormatField:221-229` (recursive ParentIndex lookup)
+  - **Fix:** Pre-group fields by ParentIndex using `Dictionary<int, List<Field>>` → O(n) lookup instead of O(n²) linear scans
+- Reduce EF Core transaction overhead:
+  - **Code:** `CaptureHandler.StoreAsync:66` (dual SaveChangesAsync calls)
+  - **Fix:** Single SaveChangesAsync with RecordTime set before persistence
 
 **Benefits**
 - ~30–40% performance improvement
@@ -118,64 +151,187 @@ Trade-off:
 ### Phase 2 — Blob-Based Response Path (Stop Point B)
 
 **Changes**
-- Store the full EPCIS payload in blob storage (per event)
-- Keep existing SQL normalization intact
-- Serve XML responses directly from blobs when possible
+- Store EPCIS XML in SQL Server FILESTREAM storage with dual granularity:
+  - **Per-event blobs:** Individual event XML fragments (~20 KB each) for selective queries
+  - **Per-capture blobs:** Complete EPCIS document for compliance exports and full retrieval
+- Keep existing SQL normalization intact (all queryable fields indexed)
+- Serve XML responses directly from FILESTREAM (no reconstruction)
+- **Deploy with dual-read mode** to handle existing data:
+  ```
+  Query Logic:
+  1. SQL query filters events (same as always)
+  2. For each matching event:
+     - Check if EventBlobId exists
+     - If YES: Fetch from FILESTREAM (fast path)
+     - If NO: Reconstruct from Field entities (legacy path for existing data)
+  3. Return response
+  ```
 
 **Benefits**
-- Eliminates recursive serialization cost (~90%)
-- Preserves full query flexibility
-- Improves read performance significantly
+- **Query performance:** Eliminates recursive serialization cost (~90% reduction in query response time for new data)
+- **Query memory:** Reduces memory usage (~70-80% for large result sets - no Field entity reconstruction)
+- **Preserves full query flexibility:** All EPCIS query parameters supported
+- **Transactional consistency:** FILESTREAM participates in SQL transactions (no reconciliation jobs)
+- **Supports scale:** 20,000-event documents efficiently (400+ MB, well within 2 GB FILESTREAM limit)
+- **Immediate deployment:** No backfill required - graceful degradation for existing data
+
+**Capture Performance Impact**
+- **No improvement** in capture time (keeps all current normalization + adds blob writes)
+- May see slight increase in capture duration (+5-10%) due to blob write overhead
+- Capture optimization requires Phase 3 (streaming parser)
 
 **Operational Cost**
-- Additional storage (blob + SQL)
-- Blob lifecycle management
+- Storage: +200-300% (dual blob storage: per-event + per-capture) for new data only
+- Disk I/O: Minimal increase (streaming access)
+- Operational complexity: +10-15% (simpler than external blob storage)
+- Code complexity: Dual-read paths must be maintained
+
+**Implementation Timeline:**
+- 6-10 weeks for focused team
 
 **Trade-offs if stopping here**
-- Capture path still expensive
-- Peak memory during ingestion unchanged
+- Excellent query performance gains for new data
+- Performance inconsistent (new data fast, old data slow)
+- Legacy reconstruction code must be maintained
+- Capture remains slow for large documents (Phase 3 needed for capture optimization)
+
+**Metrics to Track:**
+- Blob hit rate (target: >80% of queries within 1 month of deployment)
+- Legacy reconstruction calls (should decrease as new data arrives)
+- Query response time distribution (new vs old data)
 
 ---
 
-### Optional Phase 3 — Hybrid Capture Optimization (Stop Point C)
+### Optional Phase 2B — Backfill Existing Data
+
+**Only pursue if:** Performance consistency needed for historical queries or legacy code retirement desired.
 
 **Changes**
-- Reduce capture-time normalization, deliberately trading immediate SQL query flexibility for non-projected fields in exchange for improved ingestion performance, while preserving full EPCIS data in blob storage for future query or projection needs.
-- Optionally introduce query-optimized projections in SQL Server for indexed and frequently queried fields, based on observed query patterns, while retaining the full normalized EPCIS model.
-- Blob storage is used solely to persist the full EPCIS payload; SQL remains the authoritative query engine.
+- Background job reconstructs XML from existing Field entities
+- Writes blobs to FILESTREAM for events where EventBlobId IS NULL
+- Can prioritize hot data (recently queried) over cold data
+- Enables retirement of legacy reconstruction code once complete
 
-**Benefits**
-- Peak memory reduction of ~70–85% (depending on normalization strategy)
-- Faster ingestion
-- Retains most query expressiveness
+**Backfill Strategy Options:**
 
-**Operational Cost**
-- Schema complexity increases
-- Requires governance of indexed custom fields
+#### **Option 1: Full Backfill**
+```
+Migration Job (low priority, background):
+1. SELECT EventId FROM Event WHERE EventBlobId IS NULL
+2. For each event:
+   - Reconstruct XML from Field entities (using current formatters)
+   - Write to FILESTREAM
+   - Update Event.EventBlobId
+3. Run continuously until all events backfilled
+```
 
-**Trade-offs if stopping here**
-- Some niche queries may require additional indexing later
-- Increased operational complexity
+**Pros:**
+- Eventually achieves uniform performance
+- Can retire legacy reconstruction code
+- Complete migration
+
+**Cons:**
+- Backfill could take days/weeks (millions of events)
+- Requires reconstructing XML
+- Database load during backfill
+
+**Timeline:** 2-4 weeks to implement job, 1-6 months to complete backfill (depends on data volume)
 
 ---
 
-### Optional Phase 4 — Streaming Ingestion (Stop Point D)
+#### **Option 2: Selective Backfill (Recommended)**
+```
+Migration Strategy:
+1. Identify hot data (queries in last 30-90 days)
+2. Backfill hot data first (prioritize by query frequency)
+3. Skip cold data (never queried or >1 year old)
+4. Optional: Full backfill for remaining data (low priority)
+```
 
-**Changes**
-- Replace DOM parsing with streaming XML parser
-- Extract indexes and write blob in a single pass
+**Pros:**
+- Fast time-to-value (hot data optimized quickly)
+- Reduced total backfill cost (skip cold data)
+- Flexible stopping point
 
-**Benefits**
-- Eliminates DOM memory spikes
-- Improves ingestion stability for very large files
+**Cons:**
+- Requires query analytics to identify hot data
+- Permanent dual-read for cold data (or eventual full backfill)
+
+**Timeline:** 2-4 weeks for hot data (20-30% of total), 3-6 months for full backfill (optional)
+
+---
+
+#### **Option 3: Cutover Date (No Backfill)**
+```
+Query Logic:
+- Events where RecordTime < Phase2DeploymentDate: Use legacy reconstruction
+- Events where RecordTime >= Phase2DeploymentDate: Use FILESTREAM blobs
+```
+
+**Pros:**
+- No backfill work needed
+- Predictable performance (date-based)
+- Simpler implementation (no blob existence check)
+
+**Cons:**
+- Historical data never benefits from optimization
+- Must maintain two code paths indefinitely
+- Performance cliff at cutover date
+
+**Timeline:** None (use dual-read date check instead of blob existence check)
+
+---
+
+**Benefits (Phase 2B)**
+- Uniform performance across all data (old and new)
+- Can retire legacy reconstruction code
+- Consistent query response times
 
 **Operational Cost**
-- Higher implementation complexity
-- Harder debugging and validation
+- Database load during backfill (CPU + I/O for reconstruction)
+- Storage: +200-300% for backfilled data
+- 1-6 months of backfill runtime (depends on data volume and strategy)
 
 **Trade-offs if stopping here**
-- Query flexibility unchanged
-- Serialization costs already solved in earlier phases
+- Requires reconstructing XML (ironic - the thing we're avoiding in queries)
+- Database load during migration
+- Can be skipped if dual-read performance is acceptable
+
+**Metrics to Track:**
+- Backfill progress (events migrated per day)
+- Blob hit rate (should approach 100% as backfill progresses)
+- Legacy reconstruction calls (should trend to zero)
+
+---
+
+### Optional Phase 3 — Streaming Ingestion (Stop Point C)
+
+**Only pursue if:** Phase 2 insufficient for extreme-scale documents (>500 MB) or memory constraints remain critical.
+
+**Changes**
+- Replace DOM parsing (`XDocument.LoadAsync`) with streaming XML parser (`XmlReader`)
+- Extract indexes and write FILESTREAM blobs in single pass
+- Memory usage: 300-500 MB → 10-20 MB during capture
+
+**Benefits**
+- **Capture performance:** Major improvement (~80-86% reduction in capture duration)
+  - Eliminates DOM loading (10s saved)
+  - Eliminates Field entity creation and DB inserts (30-50s saved)
+- **Capture memory:** Eliminates DOM memory spikes (~95% reduction: 300-500 MB → 10-20 MB)
+- **Supports extreme-scale:** Documents >500 MB, up to 1 GB+
+- **Improves stability:** No memory exhaustion on large captures
+
+**Operational Cost**
+- Higher implementation complexity (streaming parser + schema validation)
+- More complex XSD validation (schema-validating `XmlReader` or separate pass)
+- Harder debugging and validation (can't inspect full DOM)
+
+**Implementation Timeline:**
+- 4-6 weeks
+
+**Trade-offs if stopping here**
+- Query performance already optimized in Phase 2
+- This phase purely for capture optimization
 
 ---
 
@@ -184,7 +340,7 @@ Trade-off:
 ### Rationale
 
 Large EPCIS documents can exceed HTTP and reverse-proxy timeout limits.
-Asynchronous capture decouples request acceptance from ingestion processing.
+Asynchronous capture decouples request acceptance from ingestion processing while maintaining EPCIS compliance.
 
 This endpoint is **additive** and does not modify the behavior or contract of existing synchronous capture endpoints.
 
@@ -196,15 +352,22 @@ Add a new endpoint:
 
 ```
 POST /capture/async
+→ Full XSD validation (synchronous, 5-15 seconds)
 → 202 Accepted
 → Returns CaptureId
 ```
 
-Processing occurs in background:
-- Parse
-- Validate
-- Persist
-- Notify
+**EPCIS Compliance:**
+- EPCIS 2.0 spec Section 8.2.7 requires validation before acknowledgment
+- **Full XSD validation occurs synchronously** before 202 response (spec-compliant)
+- **Persistence happens asynchronously** (FILESTREAM blobs + SQL indexes in single ACID transaction)
+
+**Processing Timeline:**
+- Synchronous (in HTTP request): XSD validation (5-15s)
+- Asynchronous (background job, single SQL transaction):
+  - Parse and extract indexes
+  - Write FILESTREAM blobs (XML to filesystem) + SQL index rows (atomic commit)
+  - Notify subscribers
 
 ---
 
@@ -249,27 +412,39 @@ GET /capture/{captureId}/status
 
 | Adoption Stage | User Experience | System Load | Complexity |
 |---------------|-----------------|-------------|------------|
-| Not adopted | Long blocking calls | High | Low |
-| Async only | Immediate response | Same total work | Medium |
-| Async + Hybrid | Immediate + faster processing | Lower | High |
+| Not adopted | Long blocking calls (2+ min) | High | Low |
+| Async (validation only) | 15s synchronous validation → 202 | Same total work | Medium |
+| Async + Phase 2 (Hybrid) | 15s validation → 202, faster background processing | Lower | Medium-High |
 
 Important:
-- Async capture **hides latency**, it does not eliminate cost
-- Best combined with Hybrid storage
+- Async capture **hides persistence latency**, validation still synchronous (EPCIS compliant)
+- Best combined with Phase 2 Hybrid storage for maximum benefit
 
 ---
 
 ## Operational Cost Considerations
 
-| Dimension | Cost Impact |
-|--------|-------------|
-| Storage | Increased (SQL + Blob) |
-| Monitoring | Blob lifecycle + async jobs |
-| Backups | Dual storage strategy |
-| Complexity | Higher, but controlled |
-| Scalability | Significantly improved |
+| Dimension | Phase 1 (Current) | Phase 2 (FILESTREAM) | Change |
+|-----------|-------------------|----------------------|---------|
+| **Storage** | SQL tables only | SQL tables + FILESTREAM (per-event + per-capture blobs) | +200-300% |
+| **Disk I/O** | Heavy (complex joins, field reconstruction) | Light (streaming blob reads) | -40-60% |
+| **Backup** | SQL backup | SQL backup (includes FILESTREAM automatically) | No change in process |
+| **Monitoring** | SQL Server only | SQL Server + FILESTREAM disk usage | +10-15% complexity |
+| **Platform** | SQL Server | SQL Server (no new tech) | No change |
+| **Scalability** | Limited (memory-bound queries) | Improved (streaming, horizontal scale) | Significant gain |
 
-The Hybrid model trades **infrastructure simplicity** for **performance and scalability**.
+**Storage Cost Breakdown (20,000 events/capture):**
+- Normalized SQL: ~50 MB (Event rows, indexes)
+- Per-event blobs: ~200 MB compressed (20,000 × 10 KB avg)
+- Per-capture blob: ~150 MB compressed (single document)
+- **Total: ~400 MB per capture** (vs. 50 MB current)
+
+**Cost Justification:**
+- Storage: Cheap ($0.02-0.10/GB/month for SQL Server storage)
+- Performance: +300-500% improvement in critical paths
+- Operational: Simpler than external blob storage (single platform, single backup)
+
+The Hybrid model with FILESTREAM trades **storage cost** for **performance and operational simplicity**.
 
 ---
 
@@ -279,26 +454,21 @@ The following areas have been intentionally left open at this stage.
 They represent **known architectural decision points** that should be resolved based on
 operational constraints, observed usage patterns, and compliance requirements.
 
-### Source of Truth and Ingestion Consistency
-- Atomicity guarantees between SQL persistence and blob storage
-- Failure and retry semantics when one persistence layer succeeds and the other fails
-- Need for ingestion state tracking and reconciliation jobs
+### Storage Strategy (Phase 2)
+- **Resolved:** Use SQL Server FILESTREAM for transactional consistency
+- FILESTREAM participates in SQL transactions (atomic commit of SQL + blobs)
+- No distributed transaction complexity or reconciliation jobs needed
+- Single backup strategy (SQL backup includes FILESTREAM)
 
-### Phase 3 Operating Mode (Normalization Strategy)
-- Whether reduced normalization implies:
-  - deferred full normalization (background processing), or
-  - selective normalization with fallback query paths
-- Impact on existing EPCIS query endpoints and subscriptions
+### Phase 3 Streaming Ingestion Validation Strategy
+- Schema validation approach when using streaming XML parsing (`XmlReader` with schema validation)
+- Security constraints (entity expansion, depth limits, size limits) - need tighter controls with streaming
+- Performance impact of schema-validating reader vs. DOM validation
 
-### Streaming Ingestion Validation Strategy
-- Schema validation approach when using streaming XML parsing
-- Security constraints (entity expansion, depth limits, size limits)
-- Compliance implications of synchronous vs asynchronous validation
-
-### Query-Optimized Projection Governance
-- Criteria for promoting fields to query-optimized projections
-- Backfill strategy for historical EPCIS payloads
-- Versioning and rollback of projection schemas
+### Cosmos DB Migration Trigger Criteria
+- At what scale does SQL Server FILESTREAM become insufficient? (>10M captures/month? >100 TB?)
+- Cost/benefit analysis: SQL licensing vs. Cosmos DB RU costs
+- Query pattern analysis: When do document queries dominate over relational joins?
 
 These topics are explicitly acknowledged as future design decisions and do not invalidate
 the phased migration strategy described in this document.
@@ -307,16 +477,26 @@ the phased migration strategy described in this document.
 
 ## Final Recommendation
 
-Adopt a **Hybrid architecture with phased migration**, using SQL Server as the primary query engine
-and blob storage as a fidelity-preserving response path.
+Adopt a **Hybrid architecture with phased migration**:
+- **Phase 1 (2-3 weeks):** Algorithmic optimizations → 30-40% improvement
+- **Phase 2 (6-10 weeks):** SQL Server FILESTREAM dual blob storage with dual-read mode → 90% query improvement for new data (no capture improvement)
+- **Phase 2B (optional, 1-6 months):** Backfill existing data → uniform performance for all data, retire legacy code
+- **Phase 3 (optional, 4-6 weeks):** Streaming parser → 80-86% capture improvement
 
-Introduce asynchronous capture as an **optional, orthogonal capability**, not a prerequisite.
+**Storage Strategy:** SQL Server FILESTREAM (transactional, single platform, proven at scale)
+
+**Deployment Strategy:** Dual-read mode enables immediate Phase 2 deployment without backfill
+
+**Async capture:** Optional enhancement, EPCIS-compliant (full XSD validation before 202)
+
+**Total timeline:** 2-3 months for focused team to reach production-ready Phase 2
 
 This strategy:
-- Preserves EPCIS query semantics
-- Allows early stopping with real gains
-- Avoids irreversible architectural decisions
-- Supports gradual operational adoption
+- Preserves EPCIS query semantics (no functionality loss)
+- Delivers major performance gains (Phase 2 sufficient for most workloads)
+- Uses existing SQL Server infrastructure (no new platforms)
+- Enables immediate deployment with graceful degradation (dual-read mode)
+- Makes backfilling truly optional (Phase 2B)
 
 ---
 
