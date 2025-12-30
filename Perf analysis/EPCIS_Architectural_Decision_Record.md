@@ -1,10 +1,23 @@
 
-# EPCIS Architectural Alternatives & Performance Analysis
+# EPCIS Architectural Decision Record
+
+> **Document Type:** Historical record of architectural exploration and decision-making process
+>
+> **Status:** Finalized - December 30, 2024
+>
+> **Related Documents:**
+> - [Executive Summary](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md)
+> - [Hybrid Strategy & Phased Migration](EPCIS_Performance_Architecture_Hybrid_Phasing.md)
 
 ## Purpose
 
-This document consolidates the architectural alternatives and performance analyses produced during the exploratory phase of the EPCIS performance investigation.  
-It is intended as a **design exploration companion** to the main architecture proposal, capturing reasoning, trade-offs, and rejected options.
+This document captures the architectural alternatives evaluated during the EPCIS performance investigation, along with the reasoning for selecting the SQL Server Hybrid Architecture approach.
+
+It serves as a **historical record** of:
+- Options considered
+- Trade-offs analyzed
+- Decisions made
+- Rejected approaches and why
 
 This document is **analysis-only** and does not propose implementation commitments.
 

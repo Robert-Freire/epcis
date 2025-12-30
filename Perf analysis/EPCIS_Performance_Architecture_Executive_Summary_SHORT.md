@@ -28,32 +28,39 @@ These issues limit scalability and operational reliability.
 
 ### Phase 1: Low-Risk Optimizations (2-3 weeks)
 - Fix configuration bugs and O(n²) field reconstruction
-- **Result:** 30-40% improvement, zero architectural change
+- **Expected Result:** 30-40% improvement, zero architectural change
 
 ### Phase 2: Blob-Based Queries (6-10 weeks) ⭐ **Recommended Stopping Point**
 - Store XML in FILESTREAM, serve queries from blobs
 - Deploy with dual-read mode (immediate deployment, no backfill)
-- **Result:** 90% query serialization reduction, 70-80% memory reduction (for new data)
+- **Expected Result:** ~90% query serialization reduction, ~70-80% memory reduction (for new data)
 - **Trade-off:** +200-300% storage for new data, no capture improvement
 
 ### Phase 3: Backfill Existing Data (1-6 months, optional)
 - Background job writes blobs for historical data
-- **Result:** Uniform performance, retire legacy code
+- **Expected Result:** Uniform performance, retire legacy code
 - **Decision:** Only if historical query consistency critical
 
 ### Phase 4: Streaming Capture (4-6 weeks, optional)
 - Replace DOM parsing with streaming parser
-- **Result:** 80-86% capture time reduction, 95% memory reduction
+- **Expected Result:** ~80-86% capture time reduction, ~95% memory reduction
 - **Decision:** Only if capture performance problematic after Phase 2
+
+> **Note:** Performance estimates are based on architectural analysis and preliminary profiling. Actual results will vary based on workload characteristics (event complexity, ILMD depth, extension usage). Phase 1 validation will establish concrete baseline metrics.
 
 ---
 
-## Success Criteria (Phase 2)
+## Success Criteria (To Be Defined)
 
-- Query response: < 2 seconds for 1,000 events
-- Query memory: < 50 MB per query
-- No capture regression
-- No availability degradation
+Success criteria for Phase 2 should be established after Phase 1 completes and baseline metrics are collected.
+
+**Suggested targets:**
+- Query response time: Significant improvement over Phase 1 baseline
+- Query memory usage: Measurable reduction for blob-backed queries
+- Capture performance: No regression from Phase 1
+- Availability: No degradation in success rate
+
+**Metrics collection:** Use existing FasTnT.PerformanceTest project to establish baselines and validate improvements.
 
 ---
 
@@ -84,8 +91,9 @@ These issues limit scalability and operational reliability.
 ## Recommendation
 
 **Execute immediately:**
-1. **Phase 1** (2-3 weeks) - Low risk, clear value
-2. **Phase 2** (6-10 weeks) - Production-ready after validation gates
+1. **Approve Phase 1** (2-3 weeks) - Low risk, establish baseline metrics
+2. **Define Phase 2 success criteria** - Based on Phase 1 baseline results
+3. **Approve Phase 2** (6-10 weeks) - Production-ready after validation gates
 
 **Total: 2-3 months** for focused team to reach production deployment
 
@@ -115,9 +123,9 @@ These issues limit scalability and operational reliability.
 
 ## Next Steps
 
-1. **Approve Phase 1** - Begin immediately
-2. **Define Phase 2 success criteria** - Establish measurable targets
-3. **Approve storage cost budget** - Expect +200-300% for new data
+1. **Approve Phase 1** - Begin immediately, establish baseline metrics
+2. **Review FasTnT.PerformanceTest project** - Ensure adequate coverage for validation
+3. **Approve storage cost budget** - Expect +200-300% for new data (incremental)
 4. **Review detailed technical plan** - See *EPCIS Performance Architecture – Hybrid Strategy & Phased Migration*
 
 ---
@@ -125,6 +133,7 @@ These issues limit scalability and operational reliability.
 ## Related Documents
 
 - [EPCIS Performance Architecture – Hybrid Strategy & Phased Migration](EPCIS_Performance_Architecture_Hybrid_Phasing.md) *(Full technical details)*
-- [EPCIS Architectural Alternatives Analysis](EPCIS_Architectural_Alternatives_Analysis.md) *(Design exploration)*
 - [EPCIS Performance Architecture – Technical Appendix](EPCIS_Performance_Architecture_Executive_Summary.md) *(Extended summary with implementation details)*
+- [EPCIS Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) *(Historical: alternatives considered, decisions made)*
+- [Performance Test Validation Strategy](Performance_Test_Validation_Strategy.md) *(How to use FasTnT.PerformanceTests for validation)*
 

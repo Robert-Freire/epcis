@@ -101,10 +101,10 @@ The strategy is deliberately phased to allow early value and controlled adoption
 
 ## Optional: Asynchronous Capture
 
-- `POST /capture/async` → XSD validation (synchronous, 5-15s) → 202 Accepted
-- Persistence happens asynchronously (FILESTREAM + SQL in single transaction)
-- EPCIS 2.0 compliant (validation before acknowledgment)
-- See Hybrid Phasing document for details
+For HTTP timeout prevention, an optional async endpoint can be added:
+- `POST /capture/async` → XSD validation (synchronous) → 202 Accepted → background persistence
+- EPCIS 2.0 compliant (validation before acknowledgment, persistence asynchronous)
+- See Hybrid Phasing document for full specification
 
 ---
 
@@ -166,5 +166,7 @@ Use this matrix to determine optimal stopping point:
 
 ## Related Documents
 
-- [EPCIS Performance Architecture – Hybrid Strategy & Phased Migration](EPCIS_Performance_Architecture_Hybrid_Phasing.md)
-- [EPCIS Architectural Alternatives Analysis](EPCIS_Architectural_Alternatives_Analysis.md)
+- [Executive Summary (Short Version)](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md) *(2-page decision-maker version)*
+- [EPCIS Performance Architecture – Hybrid Strategy & Phased Migration](EPCIS_Performance_Architecture_Hybrid_Phasing.md) *(Full technical specification)*
+- [EPCIS Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) *(Historical: alternatives considered)*
+- [Performance Test Validation Strategy](Performance_Test_Validation_Strategy.md) *(Validation approach using FasTnT.PerformanceTests)*

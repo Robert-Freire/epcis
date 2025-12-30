@@ -1,6 +1,8 @@
 
 # EPCIS Performance Architecture — Hybrid Strategy & Phased Migration
 
+> **Code References:** File paths and line numbers in this document are accurate as of December 30, 2024. If line numbers have changed, search for the code pattern or function name described.
+
 ## Purpose
 
 This document defines the EPCIS performance optimization strategy using a **Hybrid architecture**:
@@ -337,88 +339,21 @@ Query Logic:
 
 ## Optional Extension: Asynchronous Capture Endpoint
 
-### Rationale
+For HTTP timeout prevention, an optional asynchronous capture endpoint can be added:
 
-Large EPCIS documents can exceed HTTP and reverse-proxy timeout limits.
-Asynchronous capture decouples request acceptance from ingestion processing while maintaining EPCIS compliance.
+**Endpoint:** `POST /capture/async`
+- Full XSD validation (synchronous, 5-15s) → 202 Accepted
+- Persistence happens asynchronously (FILESTREAM + SQL in single transaction)
+- Status endpoint: `GET /capture/{captureId}/status` returns current state
 
-This endpoint is **additive** and does not modify the behavior or contract of existing synchronous capture endpoints.
+**EPCIS 2.0 Compliance:**
+- Spec Section 8.2.7 requires validation before acknowledgment
+- Full XSD validation occurs synchronously before 202 response (compliant)
+- Only persistence happens asynchronously
 
----
-
-### Proposed Model
-
-Add a new endpoint:
-
-```
-POST /capture/async
-→ Full XSD validation (synchronous, 5-15 seconds)
-→ 202 Accepted
-→ Returns CaptureId
-```
-
-**EPCIS Compliance:**
-- EPCIS 2.0 spec Section 8.2.7 requires validation before acknowledgment
-- **Full XSD validation occurs synchronously** before 202 response (spec-compliant)
-- **Persistence happens asynchronously** (FILESTREAM blobs + SQL indexes in single ACID transaction)
-
-**Processing Timeline:**
-- Synchronous (in HTTP request): XSD validation (5-15s)
-- Asynchronous (background job, single SQL transaction):
-  - Parse and extract indexes
-  - Write FILESTREAM blobs (XML to filesystem) + SQL index rows (atomic commit)
-  - Notify subscribers
-
----
-
-### Capture Status Endpoint
-
-To support asynchronous processing, a status endpoint is introduced to allow clients
-to track ingestion progress and outcomes.
-
-```
-GET /capture/{captureId}/status
-```
-
-#### Possible States
-
-| Status | Meaning |
-|------|--------|
-| Received | Request accepted, not yet processed |
-| Processing | Ingestion in progress |
-| Completed | Ingestion completed successfully |
-| Failed | Ingestion failed (validation or processing error) |
-
-#### Example Response
-
-```json
-{
-  "captureId": "abc123",
-  "status": "Processing",
-  "submittedAt": "2025-01-10T10:12:00Z",
-  "lastUpdatedAt": "2025-01-10T10:12:45Z",
-  "error": null
-}
-```
-
-**Contract Guarantees**
-- Events become queryable only after status = `Completed`
-- Failed captures do not expose partial data
-- Status transitions are idempotent and monotonic
-
----
-
-### Trade-offs by Adoption Stage
-
-| Adoption Stage | User Experience | System Load | Complexity |
-|---------------|-----------------|-------------|------------|
-| Not adopted | Long blocking calls (2+ min) | High | Low |
-| Async (validation only) | 15s synchronous validation → 202 | Same total work | Medium |
-| Async + Phase 2 (Hybrid) | 15s validation → 202, faster background processing | Lower | Medium-High |
-
-Important:
-- Async capture **hides persistence latency**, validation still synchronous (EPCIS compliant)
-- Best combined with Phase 2 Hybrid storage for maximum benefit
+**Trade-off:**
+- Hides persistence latency but doesn't reduce total work
+- Best combined with Phase 2 Hybrid storage
 
 ---
 
@@ -503,7 +438,14 @@ This strategy:
 ## Role of This Document
 
 This document:
-- Refines the original proposal
-- Makes trade-offs explicit
-- Serves as input for architectural stress-testing
-- Enables informed decision-making at each phase
+- Provides complete technical specification for implementation
+- Makes trade-offs explicit at each phase
+- Enables informed decision-making with validation gates
+- Serves as reference for implementation team
+
+## Related Documents
+
+- [Executive Summary (Short Version)](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md) *(2-page decision-maker version)*
+- [Technical Appendix](EPCIS_Performance_Architecture_Executive_Summary.md) *(Extended summary)*
+- [Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) *(Historical: alternatives considered)*
+- [Performance Test Validation Strategy](Performance_Test_Validation_Strategy.md) *(How to validate improvements)*
