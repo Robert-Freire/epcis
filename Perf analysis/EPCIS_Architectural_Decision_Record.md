@@ -153,23 +153,31 @@ Combine full normalized SQL Server tables with SQL Server FILESTREAM blob storag
 ### Approach 4: Pre-Serialized Response Cache
 
 #### Description
-Cache formatted XML / JSON responses per event.
+Cache formatted XML / JSON responses per event using distributed caching (e.g., Azure Cache for Redis in Azure environments, or in-memory caching for single-instance deployments).
+
+#### Implementation Options
+- **Azure Cache for Redis**: Managed distributed cache, ideal for multi-instance deployments in Azure
+- **In-memory cache**: Lower latency but limited to single instance, no cross-instance sharing
+- **Cache strategy**: Cache blob references or pre-formatted responses with TTL-based expiration
 
 #### Benefits
-- Near-zero response cost on cache hits
-- Minimal architectural change
+- Near-zero response cost on cache hits (~1ms vs 100ms+ from storage)
+- Minimal architectural change (layer on top of existing query path)
+- Distributed cache (Redis) enables consistent performance across multiple app instances
+- Can cache both blob-backed responses (Phase 2+) and legacy reconstructed responses
 
 #### Effectiveness Scenarios
-- **High**: Repeated identical queries (e.g., dashboard polling)
-- **Medium**: Similar queries with overlapping events
-- **Low**: Unique queries, ad-hoc exploration, frequent captures (cache churn)
+- **High**: Repeated identical queries (e.g., dashboard polling, monitoring endpoints)
+- **Medium**: Similar queries with overlapping events (common event sets)
+- **Low**: Unique queries, ad-hoc exploration, frequent captures (cache churn from invalidation)
 
 Best suited as a **complement** to other approaches, not a primary solution.
 
 #### Limitations
-- Cold-start penalty unchanged
-- Cache invalidation complexity
-- Increased storage / memory consumption
+- Cold-start penalty unchanged (first query still pays full cost)
+- Cache invalidation complexity (must invalidate when events updated/deleted)
+- Increased storage / memory consumption (Redis: ~50% of original data size for cached responses)
+- Azure Cache for Redis cost (tier-based pricing: Basic tier ~$15-50/month, Standard ~$55-200/month)
 
 ---
 
