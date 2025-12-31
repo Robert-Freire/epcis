@@ -25,6 +25,8 @@ This document is **analysis-only** and does not propose implementation commitmen
 
 ## Baseline Performance Summary
 
+> **Note:** This baseline reflects the open-source FasTnT codebase. Production environments may have already optimized capture operations (e.g., using bulk inserts, batching strategies) which can reduce capture time from minutes to seconds. In such environments, **query serialization becomes the primary bottleneck**, making the query-focused optimizations in this document even more critical.
+
 ### Capture Flow (≈100 MB XML, ~5,000 events)
 
 - XML DOM load via `XDocument.LoadAsync`
@@ -203,6 +205,35 @@ Persist hierarchical custom fields as pre-serialized JSON instead of flat EAV ro
 
 ---
 
+### Approach 7: Azure AI Search (Lucene-based Search Engine)
+
+#### Description
+Offload EPCIS query operations to Azure AI Search (Lucene-based managed service). Events indexed in Azure AI Search for fast retrieval while SQL Server remains system of record.
+
+#### Benefits
+- Superior query performance (sub-second complex queries)
+- Full-text search on ILMD and custom extensions without EAV reconstruction
+- Advanced capabilities: faceting, fuzzy matching, geo-spatial queries
+- Azure ecosystem integration and managed scaling
+- Can store pre-formatted responses in index
+
+#### Limitations
+- Does not address capture bottlenecks (parsing, validation, persistence unchanged)
+- Data synchronization complexity and eventual consistency risks
+- Dual storage overhead (SQL + search index)
+- Higher operational complexity (+30-40%)
+- Azure vendor lock-in
+- Additional service cost (tier-based pricing)
+- Cannot participate in EPCIS capture transactions (ACID compliance)
+
+#### Complementary Option
+Could be added as optional Phase 3 after SQL Server hybrid implementation:
+- Route standard EPCIS queries to SQL Server (transactional consistency)
+- Route full-text/analytics queries to Azure AI Search (advanced features)
+- Defers decision until query patterns are understood
+
+---
+
 ## Comparative Summary
 
 | Approach | Serialization Cost | Memory Usage | Sync Duration | Complexity | Query Flexibility |
@@ -214,9 +245,11 @@ Persist hierarchical custom fields as pre-serialized JSON instead of flat EAV ro
 | Response Cache | -100%* | +50% | 0%* | Low | High |
 | Async Capture | 0% | 0% | -100%† | Medium | High |
 | JSON Fields | -70% | -50% | -30% | Low | Medium |
+| Azure AI Search | -95%‡ | 0% | 0% | High | Very High |
 
-\* Cache hit dependent  
+\* Cache hit dependent
 † Hides latency, does not reduce total work
+‡ Query-time only; capture performance unchanged
 
 ---
 
@@ -237,6 +270,14 @@ Persist hierarchical custom fields as pre-serialized JSON instead of flat EAV ro
 4. **Blob-based approaches address root causes**; other approaches address symptoms
    - Eliminates field reconstruction entirely
    - Reduces database write complexity from 50,000 rows to 5,000 rows
+
+5. **Azure AI Search vs SQL Server hybrid both address the same bottleneck**
+   - Primary production bottleneck: Query serialization (EAV reconstruction + XML/JSON formatting)
+   - Both approaches eliminate serialization: Hybrid via blob retrieval (90% improvement), Azure AI Search via pre-indexed documents (95-99% improvement)
+   - Marginal difference: ~5-9% additional query improvement vs +30-40% operational complexity
+   - **Hybrid advantage**: Also addresses capture bottlenecks (80-86% improvement); Azure AI Search does not
+   - **Azure AI Search advantage**: Advanced search capabilities (full-text, faceting, geo-spatial) beyond standard EPCIS queries
+   - **Recommended approach**: Start with SQL Server hybrid; evaluate Azure AI Search in Phase 3 if advanced search or extreme query performance is required
 
 ---
 

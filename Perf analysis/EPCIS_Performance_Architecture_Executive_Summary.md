@@ -135,7 +135,23 @@ For HTTP timeout prevention, an optional async endpoint can be added:
 - No complex joins
 - RU-based pricing (expensive for write-heavy workloads)
 
-**Recommendation:** Start with SQL Server. Consider Cosmos DB only at extreme scale (likely 2+ years out).
+**Recommendation:** Start with SQL Server. Consider Cosmos DB only at extreme scale 
+
+---
+
+## Alternative Consideration: Azure AI Search
+
+**Consider Azure AI Search (Phase 3 addition) if:**
+- Advanced search requirements (full-text, faceting, geo-spatial) beyond standard EPCIS queries
+- Extremely read-heavy workload (1000:1 query-to-capture ratio)
+- Multi-tenant analytics or business intelligence dashboards
+
+**Azure AI Search limitations for EPCIS:**
+- Does not address capture bottlenecks (parsing, validation, persistence unchanged)
+- Data synchronization complexity and eventual consistency risks
+- Additional service cost and operational overhead (+30-40% complexity)
+
+**Recommendation:** Start with SQL Server Hybrid (Phase 2). The hybrid approach already achieves 90% query improvement. Azure AI Search adds only 5-9% marginal gain for typical EPCIS workloads, but provides value if advanced search features are required. See [Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) for detailed analysis.
 
 ---
 
