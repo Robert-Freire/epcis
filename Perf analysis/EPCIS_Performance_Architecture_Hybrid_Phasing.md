@@ -1,4 +1,3 @@
-
 # EPCIS Performance Architecture — Hybrid Strategy & Phased Migration
 
 > **Code References:** File paths and line numbers in this document are accurate as of December 30, 2024. If line numbers have changed, search for the code pattern or function name described.
@@ -22,12 +21,12 @@ This is a **design document**, not an implementation plan.
 
 ## Design Principles
 
-1. **Preserve query expressiveness**
+1. **Preserve query semantics**
    - SQL-based querying remains authoritative
-   - No loss of EPCIS query semantics by default
+   - No loss of EPCIS query expressiveness by default
 
-2. **Reduce repeated work**
-   - Avoid repeated XML parsing and recursive serialization
+2. **Remove dominant cost drivers**  
+   - Focus on eliminating known hot‑path behaviors (recursive serialization, repeated XML parsing)
 
 3. **Allow staged adoption**
    - Each phase delivers value independently
@@ -112,7 +111,7 @@ Purpose:
 
 **Query Optimizer Logic:**
 ```
-If result_count < 100:
+If small result set:
     Fetch per-event blobs (selective)
 Else:
     Fetch per-capture blob (bulk)
@@ -124,11 +123,17 @@ Else:
 - CPU: Major reduction (~90% less field reconstruction)
 - Memory: Major reduction (no in-memory object graphs for serialization)
 
+**Uncertainty:** 
+ - Optimal thresholds and crossover points may be workload‑dependent.
+
 ---
 
 ## Phased Migration Plan
 
-### Phase 1 — Low-Risk Optimizations (Stop Point A)
+### Phase 1 — Algorithmic Corrections (Low Risk)
+
+**Intent**  
+Remove clearly sub‑optimal behaviors without architectural change.
 
 **Changes**
 - Fix configuration bugs (`Constants.cs:6` - CaptureSizeLimit incorrectly set to 1 KB)
@@ -140,7 +145,7 @@ Else:
   - **Fix:** Single SaveChangesAsync with RecordTime set before persistence
 
 **Benefits**
-- ~30–40% performance improvement
+- Noticeable performance improvement in capture (expected ~30–40%)
 - No architectural change
 - Zero operational impact
 
@@ -151,6 +156,9 @@ Else:
 ---
 
 ### Phase 2 — Blob-Based Response Path (Stop Point B)
+
+**Intent**  
+Remove XML reconstruction from the query hot path.
 
 **Changes**
 - Store EPCIS XML in SQL Server FILESTREAM storage with dual granularity:
@@ -170,8 +178,8 @@ Else:
   ```
 
 **Benefits**
-- **Query performance:** Eliminates recursive serialization cost (~90% reduction in query response time for new data)
-- **Query memory:** Reduces memory usage (~70-80% for large result sets - no Field entity reconstruction)
+- **Query performance:** Eliminates recursive serialization cost (expected ~90% reduction in query response time for new data)
+- **Query memory:** Reduces memory usage by avoiding Field entity reconstruction, which otherwise creates large in-memory object graphs.
 - **Preserves full query flexibility:** All EPCIS query parameters supported
 - **Transactional consistency:** FILESTREAM participates in SQL transactions (no reconciliation jobs)
 - **Supports scale:** 20,000-event documents efficiently (400+ MB, well within 2 GB FILESTREAM limit)
@@ -413,10 +421,10 @@ the phased migration strategy described in this document.
 ## Final Recommendation
 
 Adopt a **Hybrid architecture with phased migration**:
-- **Phase 1 (2-3 weeks):** Algorithmic optimizations → 30-40% improvement
-- **Phase 2 (6-10 weeks):** SQL Server FILESTREAM dual blob storage with dual-read mode → 90% query improvement for new data (no capture improvement)
+- **Phase 1 (2-3 weeks):** Algorithmic optimizations → expected 30-40% improvement
+- **Phase 2 (6-10 weeks):** SQL Server FILESTREAM dual blob storage with dual-read mode → expected 90% query improvement for new data (no capture improvement)
 - **Phase 3 (optional, 1-6 months):** Backfill existing data → uniform performance for all data, retire legacy code
-- **Phase 4 (optional, 4-6 weeks):** Streaming parser → 80-86% capture improvement
+- **Phase 4 (optional, 4-6 weeks):** Streaming parser → expected 80-86% capture improvement
 
 **Storage Strategy:** SQL Server FILESTREAM (transactional, single platform, proven at scale)
 
