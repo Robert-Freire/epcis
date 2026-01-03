@@ -27,10 +27,12 @@ The `tests/FasTnT.PerformanceTests` project uses BenchmarkDotNet and includes:
 ## Phase 1 Validation Strategy
 
 ### Goal
-Validate **30-40% improvement** in query response time and capture duration from:
-1. Fixing configuration bugs (Constants.cs)
-2. Optimizing O(n²) field reconstruction (XmlEventFormatter.FormatField)
-3. Reducing EF Core transaction overhead (CaptureHandler.StoreAsync)
+Validate **40-60% improvement** in query response time and capture duration from:
+1. Fixing configuration bugs (Constants.cs, CaptureDocumentRequest.cs)
+2. Optimizing O(n²) field reconstruction (XmlEventFormatter.FormatField and JsonEventFormatter.BuildElement)
+3. Adding database indexes on critical query fields
+4. Applying EF Core 10 optimizations (Compiled Queries, AsNoTrackingWithIdentityResolution)
+5. **Validation benchmark:** Measure serialization % vs SQL query % to determine Phase 2 path
 
 ### Validation Process
 
@@ -50,11 +52,17 @@ dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters js
 
 #### Step 2: Apply Phase 1 Optimizations
 
-1. Fix `src/FasTnT.Domain/Constants.cs:6` - CaptureSizeLimit
-2. Optimize `src/FasTnT.Host/Communication/Xml/Formatters/XmlEventFormatter.cs:221-229`
+1. Fix `src/FasTnT.Domain/Constants.cs:6` - CaptureSizeLimit (verify deployment requirements)
+2. Fix `src/FasTnT.Host/Endpoints/Interfaces/CaptureDocumentRequest.cs:16` - **Critical:** Validation compares ContentLength to MaxEventsReturnedInQuery instead of CaptureSizeLimit
+3. Optimize `src/FasTnT.Host/Communication/Xml/Formatters/XmlEventFormatter.cs:221-229`
    - Pre-group fields by ParentIndex using `Dictionary<int, List<Field>>`
-3. Optimize `src/FasTnT.Application/Handlers/CaptureHandler.cs:66`
-   - Single SaveChangesAsync instead of dual calls
+4. Optimize `src/FasTnT.Host/Communication/Json/Formatters/JsonEventFormatter.cs` (similar O(n²) pattern in BuildElement methods)
+5. Add database indexes:
+   - `Event.BusinessStep`, `Event.Disposition`, `Event.EventTime`, `Event.Request.UserId`
+   - **Critical:** `Field.ParentIndex` (required for O(n²) fix effectiveness)
+6. Apply EF Core 10 optimizations:
+   - Compiled Queries in `src/FasTnT.Application/Database/DataSources/EventQueryContext.cs`
+   - AsNoTrackingWithIdentityResolution for complex event queries
 
 #### Step 3: Run Phase 1 Benchmarks
 
@@ -67,26 +75,120 @@ dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters js
 #### Step 4: Compare Results
 
 **Success Criteria:**
-- Capture duration: ≥30% reduction (Phase 1 vs Phase 0)
-- Serialization duration: ≥30% reduction (Phase 1 vs Phase 0)
+- Capture duration: ≥40% reduction (Phase 1 vs Phase 0)
+- Serialization duration: ≥40% reduction (Phase 1 vs Phase 0)
 - Memory usage: Moderate reduction or no regression
 
 **Validation Gate:**
-- [ ] Capture improvement ≥30%
-- [ ] Serialization improvement ≥30%
+- [ ] Capture improvement ≥40%
+- [ ] Serialization improvement ≥40%
 - [ ] No functional regressions (all tests pass)
-- **Decision:** If passed → Proceed to Phase 2
+- **Decision:** If passed → Proceed to Phase 1 Bottleneck Analysis
+
+#### Step 5: Phase 1 Bottleneck Analysis (NEW)
+
+**Goal:** Determine which Phase 2 option to pursue
+
+**Add new benchmark to measure time breakdown:**
+```csharp
+// In SerializationBenchmarks.cs or new BottleneckAnalysisBenchmarks.cs
+
+[Benchmark]
+public QueryResponse ExecuteFullQueryPipeline()
+{
+    var stopwatch = Stopwatch.StartNew();
+
+    // 1. SQL query execution
+    var sqlStart = stopwatch.ElapsedMilliseconds;
+    var events = _context.QueryEvents(parameters).ToList();
+    var sqlTime = stopwatch.ElapsedMilliseconds - sqlStart;
+
+    // 2. Serialization (field reconstruction + XML formatting)
+    var serializationStart = stopwatch.ElapsedMilliseconds;
+    var xml = XmlQueryResponseFormatter.Format(new QueryResponse { Events = events });
+    var serializationTime = stopwatch.ElapsedMilliseconds - serializationStart;
+
+    Console.WriteLine($"SQL Query: {sqlTime}ms ({sqlTime * 100.0 / stopwatch.ElapsedMilliseconds:F1}%)");
+    Console.WriteLine($"Serialization: {serializationTime}ms ({serializationTime * 100.0 / stopwatch.ElapsedMilliseconds:F1}%)");
+
+    return new QueryResponse { Events = events };
+}
+```
+
+**Decision Criteria:**
+- **If Serialization 60-80%** → Phase 2B (Blob Storage) - Eliminates serialization bottleneck
+- **If SQL Query >40%** → Phase 2A (Redis Cache) - Bypasses SQL on cache hits
+- **If Both high** → Phase 2C (Hybrid) - Best of both approaches
+
+**Expected Finding:** Serialization is 60-80% of query time → Phase 2B recommended
 
 ---
 
 ## Phase 2 Validation Strategy
 
-### Goal
-Validate **90% query serialization reduction, 70-80% memory reduction** from blob-based queries.
+Choose validation strategy based on Phase 1 bottleneck analysis:
 
-### Required: Add Blob-Based Benchmark
+---
 
-Phase 2 introduces FILESTREAM blobs. The existing SerializationBenchmarks tests reconstruction-based serialization. Need to add blob-path benchmark.
+### Phase 2A Validation Strategy (Redis Cache)
+
+**Goal:** Validate near-zero latency (1-5 ms) on cache hits
+
+#### Required: Add Redis Cache Benchmark
+
+**Suggested Addition:**
+```csharp
+// In new RedisCacheBenchmarks.cs
+
+[Benchmark(Baseline = true)]
+public async Task<string> QueryWithoutCache()
+{
+    // Current path: SQL query + reconstruction + serialization
+    var events = await _context.QueryEvents(parameters).ToListAsync();
+    return XmlQueryResponseFormatter.Format(new QueryResponse { Events = events });
+}
+
+[Benchmark]
+public async Task<string> QueryWithCacheHit()
+{
+    // Phase 2A path: fetch from Redis cache
+    var cacheKey = _cacheService.GenerateKey(parameters);
+    return await _cacheService.GetAsync(cacheKey) ?? await QueryWithoutCache();
+}
+
+[Benchmark]
+public async Task<string> QueryWithCacheMiss()
+{
+    // Phase 2A path: cache miss, populate cache
+    var cacheKey = _cacheService.GenerateKey(parameters);
+    await _cacheService.InvalidateAsync(cacheKey); // Force cache miss
+    var result = await _context.QueryEvents(parameters).ToListAsync();
+    var xml = XmlQueryResponseFormatter.Format(new QueryResponse { Events = result });
+    await _cacheService.SetAsync(cacheKey, xml, TimeSpan.FromMinutes(15));
+    return xml;
+}
+```
+
+**Success Criteria:**
+- Cache hit latency: ≤10 ms (target: 1-5 ms)
+- Cache miss latency: Similar to Phase 1 baseline (no degradation)
+- Cache hit rate: Track in production (target: 40-70%)
+
+**Validation Gate:**
+- [ ] Cache hit performance ≤10 ms
+- [ ] Cache miss performance = Phase 1 baseline ±5%
+- [ ] No functional regressions
+- **Decision:** Production deployment approved
+
+---
+
+### Phase 2B Validation Strategy (Blob Storage)
+
+**Goal:** Validate **90% query serialization reduction, 70-80% memory reduction** from blob-based queries.
+
+#### Required: Add Blob-Based Benchmark
+
+Phase 2B introduces FILESTREAM blobs. The existing SerializationBenchmarks tests reconstruction-based serialization. Need to add blob-path benchmark.
 
 **Suggested Addition:**
 ```csharp
@@ -103,24 +205,24 @@ public string SerializeFromFieldEntities()
 [Benchmark]
 public async Task<string> SerializeFromBlob()
 {
-    // Phase 2 path: fetch pre-stored XML from FILESTREAM
+    // Phase 2B path: fetch pre-stored XML from FILESTREAM
     return await _blobStorage.FetchEventXmlAsync(eventIds);
 }
 ```
 
-### Validation Process
+#### Validation Process
 
-#### Step 1: Run Phase 1 Baseline
+**Step 1: Run Phase 1 Baseline**
 
-Use Phase 1 results as baseline for Phase 2 comparison.
+Use Phase 1 results as baseline for Phase 2B comparison.
 
-#### Step 2: Implement Phase 2 (Dual-Read Mode)
+**Step 2: Implement Phase 2B (Dual-Read Mode)**
 
 1. Add FILESTREAM columns (EventBlobId, DocumentBlobId)
 2. Implement dual-read logic (check if blob exists → fetch blob OR reconstruct)
 3. New captures write blobs
 
-#### Step 3: Run Phase 2 Benchmarks
+**Step 3: Run Phase 2B Benchmarks**
 
 ```bash
 # Query against NEW data (with blobs)
@@ -130,7 +232,7 @@ dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters js
 dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters json md --artifacts artifacts/phase2-old
 ```
 
-#### Step 4: Compare Results
+**Step 4: Compare Results**
 
 **Success Criteria (New Data with Blobs):**
 - Serialization duration: ≥90% reduction vs Phase 1
@@ -145,6 +247,25 @@ dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters js
 - [ ] New data memory usage 70-80% lower
 - [ ] Old data performance unchanged (dual-read works)
 - [ ] No functional regressions
+- **Decision:** Production deployment approved
+
+---
+
+### Phase 2C Validation Strategy (Hybrid)
+
+**Goal:** Validate combined benefits of Redis cache + Blob storage
+
+**Approach:** Run both Phase 2A and Phase 2B validation strategies
+
+**Expected Results:**
+- Cache hit performance: 1-5 ms (Redis)
+- Cache miss performance (new data): 90% faster than Phase 1 (blobs)
+- Cache miss performance (old data): Same as Phase 1 (reconstruction)
+
+**Validation Gate:**
+- [ ] All Phase 2A success criteria met
+- [ ] All Phase 2B success criteria met
+- [ ] No conflicts between Redis and blob storage
 - **Decision:** Production deployment approved
 
 ---
@@ -197,17 +318,29 @@ public string SerializeEventsWithDenseCustomFields()
 
 **Phase 1 Validation:**
 - Use existing CaptureBenchmarks and SerializationBenchmarks
-- Run before/after, compare 30-40% improvement
-- **Ready to use as-is** (minor: add 5000 event param)
+- Run before/after, compare 40-60% improvement
+- **NEW:** Add bottleneck analysis benchmark to measure serialization % vs SQL query %
+- **Requires ~2-3 hours** to add bottleneck analysis benchmark
 
-**Phase 2 Validation:**
+**Phase 2A Validation (Redis Cache):**
+- Need to add Redis cache benchmarks (cache hit, cache miss)
+- Compare cache hit vs baseline performance
+- **Requires ~2-3 hours** to add Redis cache benchmarks
+
+**Phase 2B Validation (Blob Storage):**
 - Need to add blob-path benchmarks
 - Compare blob vs reconstruction performance
-- **Requires ~2-3 hours to add blob benchmarks**
+- **Requires ~2-3 hours** to add blob benchmarks
 
-**Total effort to make validation-ready:** ~3-4 hours
+**Phase 2C Validation (Hybrid):**
+- Run both Phase 2A and Phase 2B validation strategies
+- **Requires ~4-6 hours** (both benchmarks)
+
+**Total effort to make validation-ready:** ~6-8 hours
+- Add bottleneck analysis benchmark (2-3 hours)
 - Add FieldReconstructionBenchmarks.cs (1-2 hours)
-- Add blob-path benchmarks for Phase 2 (2-3 hours)
+- Add Redis cache benchmarks for Phase 2A (2-3 hours)
+- Add blob-path benchmarks for Phase 2B (2-3 hours)
 - Update EventCount params to include 5000 (5 minutes)
 
 ---
@@ -216,6 +349,10 @@ public string SerializeEventsWithDenseCustomFields()
 
 1. **Approve Phase 1 optimization approach**
 2. **Run Phase 0 baseline benchmarks** (save to artifacts/phase0)
-3. **Implement Phase 1 optimizations**
-4. **Run Phase 1 benchmarks, validate ≥30% improvement**
-5. **If validated → Approve Phase 2 implementation**
+3. **Implement Phase 1 optimizations** (including database indexes, EF Core optimizations)
+4. **Run Phase 1 benchmarks, validate ≥40% improvement**
+5. **Run Phase 1 bottleneck analysis** - Determine serialization % vs SQL query %
+6. **Choose Phase 2 path** - Select 2A (Redis), 2B (Blob Storage), or 2C (Hybrid) based on bottleneck
+7. **Approve and implement selected Phase 2 option**
+8. **Run Phase 2 validation benchmarks for selected option**
+9. **Production deployment after validation gates pass**

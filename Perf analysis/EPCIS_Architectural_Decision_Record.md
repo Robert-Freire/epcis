@@ -129,7 +129,7 @@ Replace DOM-based parsing with `XmlReader` streaming.
 
 ---
 
-### Approach 3: Hybrid (Normalized + Blob) ⭐ **SELECTED APPROACH**
+### Approach 3: Hybrid (Normalized + Blob) ⭐ **OPTION B**
 
 #### Description
 Combine full normalized SQL Server tables with SQL Server FILESTREAM blob storage at dual granularity:
@@ -137,47 +137,56 @@ Combine full normalized SQL Server tables with SQL Server FILESTREAM blob storag
 - Per-event XML blobs for selective retrieval
 - Per-capture XML blobs for compliance and bulk retrieval
 
+**Choose if:** Phase 1 validation shows serialization is the bottleneck (60-80% of query time)
+
 #### Benefits
 - Preserves full query flexibility (all EPCIS query parameters supported)
 - Major blob-based response performance (~90% serialization reduction)
 - Transactional consistency (FILESTREAM participates in SQL transactions)
-- Incremental migration path (Phase 1 → Phase 2 → optional Phase 3)
+- Incremental migration path (Phase 1 → Phase 2/2A → optional Phase 3)
+- Solves the root cause when serialization is the bottleneck
 
 #### Limitations
 - Increased storage footprint (3-4x: SQL indexes + per-event blobs + per-capture blobs)
 - Operational complexity increase (+10-15%: FILESTREAM monitoring)
 - Storage cost: +200-300% (mitigated by compression and cheap storage)
+- Does not help if SQL query execution is the bottleneck
 
 ---
 
-### Approach 4: Pre-Serialized Response Cache
+### Approach 4: Azure Cache for Redis (Distributed Cache) ⭐ **OPTION A**
 
 #### Description
-Cache formatted XML / JSON responses per event using distributed caching (e.g., Azure Cache for Redis in Azure environments, or in-memory caching for single-instance deployments).
+Cache complete XML/JSON query responses using Azure Cache for Redis. Bypasses SQL query execution and serialization entirely on cache hits.
+
+**Choose if:** Phase 1 validation shows SQL query execution is the bottleneck (>40% of query time)
 
 #### Implementation Options
-- **Azure Cache for Redis**: Managed distributed cache, ideal for multi-instance deployments in Azure
-- **In-memory cache**: Lower latency but limited to single instance, no cross-instance sharing
-- **Cache strategy**: Cache blob references or pre-formatted responses with TTL-based expiration
+- **Azure Cache for Redis**: Managed distributed cache (Standard C2+ tier recommended)
+- **Cache key strategy**: `epcis:query:{userId}:{format}:{queryHash}`
+- **TTL strategy**: 5-30 minutes based on query type (time-bounded vs open-ended)
+- **Graceful degradation**: Cache failures fall back to normal query path
 
 #### Benefits
-- Near-zero response cost on cache hits (~1ms vs 100ms+ from storage)
+- Near-zero response cost on cache hits (1-5 ms vs 500-2000 ms for full query path)
 - Minimal architectural change (layer on top of existing query path)
-- Distributed cache (Redis) enables consistent performance across multiple app instances
-- Can cache both blob-backed responses (Phase 2+) and legacy reconstructed responses
+- Distributed cache enables consistent performance across multiple app instances
+- No schema changes or migrations required
+- Can be implemented alongside blob storage (Option C: Hybrid)
 
 #### Effectiveness Scenarios
 - **High**: Repeated identical queries (e.g., dashboard polling, monitoring endpoints)
 - **Medium**: Similar queries with overlapping events (common event sets)
 - **Low**: Unique queries, ad-hoc exploration, frequent captures (cache churn from invalidation)
 
-Best suited as a **complement** to other approaches, not a primary solution.
+Can serve as **primary solution (Option A)** or **complement to blob storage (Option C: Hybrid)**
 
 #### Limitations
 - Cold-start penalty unchanged (first query still pays full cost)
+- Eventually consistent (1-30 min TTL, configurable by query type)
 - Cache invalidation complexity (must invalidate when events updated/deleted)
-- Increased storage / memory consumption (Redis: ~50% of original data size for cached responses)
-- Azure Cache for Redis cost (tier-based pricing: Basic tier ~$15-50/month, Standard ~$55-200/month)
+- Operational cost: Azure Redis ~$55-200/month (Standard C2-C3)
+- Does not help if serialization is the bottleneck (cache miss performance unchanged)
 
 ---
 
@@ -244,18 +253,19 @@ Could be added as optional Phase 3 after SQL Server hybrid implementation:
 
 ## Comparative Summary
 
-| Approach | Serialization Cost | Memory Usage | Sync Duration | Complexity | Query Flexibility |
-|--------|--------------------|--------------|---------------|------------|------------------|
-| Current | Baseline | Baseline | Baseline | Low | High |
-| Blob + Minimal Index | -90% | -90–96% | -80–86% | Medium | Low |
-| Streaming Parser | 0% | -80–85% | -10–20% | High | High |
-| **Hybrid (Selected)** | **-90%** | **-90–96%** | **-80–86%** | **Medium** | **High** |
-| Response Cache | -100%* | +50% | 0%* | Low | High |
-| Async Capture | 0% | 0% | -100%† | Medium | High |
-| JSON Fields | -70% | -50% | -30% | Low | Medium |
-| Azure AI Search | -95%‡ | 0% | 0% | High | Very High |
+| Approach | Serialization Cost | Memory Usage | Sync Duration | Complexity | Query Flexibility | Decision |
+|--------|--------------------|--------------|---------------|------------|------------------|----------|
+| Current | Baseline | Baseline | Baseline | Low | High | - |
+| Blob + Minimal Index | -90% | -90–96% | -80–86% | Medium | Low | - |
+| Streaming Parser | 0% | -80–85% | -10–20% | High | High | - |
+| **Option A: Redis Cache** | **-100%\*** | **+0%** | **0%\*** | **Low** | **High** | **If SQL query is bottleneck** |
+| **Option B: Blob Storage** | **-90%** | **-90–96%** | **-80–86%** | **Medium** | **High** | **If serialization is bottleneck** |
+| **Option C: Hybrid (A+B)** | **-95%** | **-90–96%** | **-80–86%** | **High** | **High** | **If both are bottlenecks** |
+| Async Capture | 0% | 0% | -100%† | Medium | High | - |
+| JSON Fields | -70% | -50% | -30% | Low | Medium | - |
+| Azure AI Search | -95%‡ | 0% | 0% | High | Very High | Phase 3 consideration |
 
-\* Cache hit dependent
+\* Cache hit dependent; cache miss = baseline performance
 † Hides latency, does not reduce total work
 ‡ Query-time only; capture performance unchanged
 
@@ -264,8 +274,9 @@ Could be added as optional Phase 3 after SQL Server hybrid implementation:
 ## Key Observations
 
 1. **Root cause**: The EAV pattern for custom fields (`Field` entity) creates O(n²) reconstruction cost
-   - Code: `XmlEventFormatter.FormatField:221-229` (recursive ParentIndex lookup)
+   - Code: `XmlEventFormatter.FormatField:221-229` and `JsonEventFormatter.BuildElement` (recursive ParentIndex lookup)
    - Impact: 1,000 events × 100 fields = 100,000 recursive calls with linear scans
+   - **Phase 1 fix**: Pre-group fields by ParentIndex using Dictionary → O(n) lookup
 
 2. **Memory spike**: XML DOM (300-500 MB) dominates capture memory
    - Code: `XmlDocumentParser.LoadDocument:44` (loads entire tree via `XDocument.LoadAsync`)
@@ -275,17 +286,33 @@ Could be added as optional Phase 3 after SQL Server hybrid implementation:
    - Code: `EpcisModelConfiguration.cs:229-242` (Field as owned entity)
    - Impact: Database write time dominated by owned entity cascade inserts
 
-4. **Blob-based approaches address root causes**; other approaches address symptoms
+4. **Phase 1 improvements (40-60% expected)**:
+   - O(n²) → O(n) field reconstruction (both XML and JSON formatters)
+   - Database indexing on Event.BusinessStep, Event.Disposition, Event.EventTime, Field.ParentIndex
+   - EF Core 10 optimizations: Compiled Queries, AsNoTrackingWithIdentityResolution
+   - Configuration bugs fixed (CaptureSizeLimit validation)
+
+5. **Phase 1 validation determines Phase 2 path**:
+   - Benchmark measures: Serialization cost % vs SQL query cost %
+   - **If serialization 60-80%** → Option B: Blob Storage (90% improvement)
+   - **If SQL query >40%** → Option A: Redis Cache (near-zero latency on cache hits)
+   - **If both high** → Option C: Hybrid (best of both)
+
+6. **Blob-based approaches (Option B) address serialization bottleneck**:
    - Eliminates field reconstruction entirely
    - Reduces database write complexity from 50,000 rows to 5,000 rows
+   - Does not help if SQL query execution is the bottleneck
 
-5. **Azure AI Search vs SQL Server hybrid both address the same bottleneck**
-   - Primary production bottleneck: Query serialization (EAV reconstruction + XML/JSON formatting)
-   - Both approaches eliminate serialization: Hybrid via blob retrieval (90% improvement), Azure AI Search via pre-indexed documents (95-99% improvement)
-   - Marginal difference: ~5-9% additional query improvement vs +30-40% operational complexity
-   - **Hybrid advantage**: Also addresses capture bottlenecks (80-86% improvement); Azure AI Search does not
-   - **Azure AI Search advantage**: Advanced search capabilities (full-text, faceting, geo-spatial) beyond standard EPCIS queries
-   - **Recommended approach**: Start with SQL Server hybrid; evaluate Azure AI Search in Phase 3 if advanced search or extreme query performance is required
+7. **Redis cache (Option A) addresses SQL query bottleneck**:
+   - Bypasses SQL entirely on cache hits (1-5 ms response)
+   - No schema changes, minimal implementation complexity
+   - Does not help if serialization is the bottleneck (cache miss = baseline performance)
+
+8. **Azure AI Search vs Options A/B/C**:
+   - Primary production bottleneck: Query performance (SQL execution + serialization)
+   - Options A/B/C address this bottleneck with lower operational complexity
+   - Azure AI Search advantage: Advanced search capabilities beyond standard EPCIS queries
+   - **Recommended approach**: Start with Option A, B, or C based on Phase 1 validation; evaluate Azure AI Search in Phase 3 if advanced search required
 
 ---
 
@@ -312,34 +339,51 @@ Could be added as optional Phase 3 after SQL Server hybrid implementation:
 
 ---
 
-## Design Decisions (Resolved)
+## Design Decisions
 
-### Blob Granularity
+### Phase 2 Architecture Choice
+**Decision Framework:** Choose based on Phase 1 validation bottleneck analysis
+- **Option A (Redis Cache):** If SQL query execution >40% of query time
+- **Option B (Blob Storage):** If serialization 60-80% of query time
+- **Option C (Hybrid):** If both bottlenecks are significant
+
+**Expected finding:** Serialization is 60-80% of query time → Option B recommended
+
+### Blob Granularity (Option B/C)
 **Decision:** Store BOTH per-event AND per-capture blobs (dual granularity)
 - Per-event blobs: Selective queries (<100 events)
 - Per-capture blobs: Bulk queries, compliance exports
 - Storage cost: 3-4x increase, justified by performance gains
 
-### Storage Technology
+### Storage Technology (Option B/C)
 **Decision:** SQL Server FILESTREAM
 - Transactional consistency (ACID guarantees)
 - Single platform (no external blob storage)
 - Proven at scale (supports 20,000-event documents)
 
-### Query Strategy
+### Cache Technology (Option A/C)
+**Decision:** Azure Cache for Redis (Standard C2+ tier)
+- Distributed cache for multi-instance deployments
+- TTL strategy: 5-30 minutes based on query type
+- Graceful degradation on cache failures
+
+### Query Strategy (All Options)
 **Decision:** Full normalization preserved
 - All EPCIS query parameters supported
 - No loss of query flexibility
-- Blob storage used only for response generation
+- Redis/blobs used only for response generation
 
 ---
 
 ## Remaining Open Questions
 
+- **Phase 1 validation results:** What is the actual bottleneck breakdown (serialization % vs SQL query %)?
+- **Phase 2 architecture choice:** Option A (Redis), Option B (Blob Storage), or Option C (Hybrid)?
+- **Cache hit rate expectations:** What is the expected cache hit rate for typical EPCIS workloads?
 - **Phase 3 (Streaming):** XSD validation strategy with `XmlReader` (schema-validating reader vs. separate validation pass)
-- **Cosmos DB migration criteria:** At what scale (>10M captures/month?) does SQL Server FILESTREAM become insufficient?
 - **Response format handling:** Store both XML and JSON blobs, or convert on-demand with caching?
 - **Compression format:** gzip (standard) vs. brotli (better compression, CPU cost)?
+- **Cosmos DB migration criteria:** At what scale (>10M captures/month?) does SQL Server become insufficient?
 
 ---
 

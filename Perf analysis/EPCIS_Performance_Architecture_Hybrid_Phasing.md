@@ -38,35 +38,52 @@ This is a **design document**, not an implementation plan.
 
 ---
 
-## Target Architecture: SQL Server Hybrid (Tables + FILESTREAM)
+## Target Architecture Options
 
-### Core Idea
+> **Note:** This document targets SQL Server deployments. The final architecture choice (Redis cache, blob storage, or hybrid) is determined after Phase 1 benchmarking validates the actual performance bottleneck.
 
-The architecture combines SQL Server relational and FILESTREAM storage:
+### Architecture Decision Framework
 
-**SQL Server Tables (Normalized):**
-- All queryable EPCIS fields indexed
-- Supports all EPCIS query parameters
+**All deployments start with:**
+- SQL Server normalized tables (all queryable EPCIS fields indexed)
 - Full query flexibility preserved
+- Phase 1 optimizations applied (O(n²) fixes, database indexes, EF Core optimizations)
 
-**SQL Server FILESTREAM (Dual Blob Storage):**
+**Phase 2 adds ONE of the following, based on Phase 1 validation:**
+
+**Option A: Redis Distributed Cache**
+- External Azure Redis cache layer
+- Caches complete XML/JSON responses (keyed by query parameters)
+- **Choose if:** SQL query execution is the bottleneck (>40% of query time)
+- **Benefit:** Near-zero latency for cache hits (1-5 ms), bypasses SQL entirely
+
+**Option B: SQL Server FILESTREAM Blob Storage**
+- Dual-granularity blob storage (per-event + per-capture)
 - **Per-event blobs:** Individual XML fragments (~20 KB each) for selective queries
-- **Per-capture blobs:** Complete EPCIS documents (~400 MB) for compliance and bulk retrieval
+- **Per-capture blobs:** Complete EPCIS documents (~400 MB) for compliance/bulk retrieval
+- **Choose if:** Serialization is the bottleneck (60-80% of query time)
+- **Benefit:** Eliminates XML reconstruction for all queries (90% improvement)
 
-This keeps SQL Server as both the query engine AND blob storage platform (single platform, transactional consistency), while eliminating expensive recursive serialization.
+**Option C: Hybrid (Both)**
+- Combines Redis cache + FILESTREAM blob storage
+- **Choose if:** Very high query volume, need best possible performance
+- **Benefit:** 1-5 ms for cache hits, 90% improvement for cache misses
+
+**The Decision:** Phase 1 benchmarking (issue #16) measures the actual bottleneck breakdown to determine which option solves the real problem.
 
 ---
 
-## Storage Model Overview
+## Storage Model Details
 
-### Normalized Relational Data (SQL)
+This section describes the storage components used across the different architecture options.
+
+### Normalized Relational Data (SQL) - Used in All Options
 
 Stored in SQL Server tables:
 - Event identifiers (EventId, unique)
 - Temporal fields (eventTime, recordTime)
 - Core EPCIS dimensions (bizStep, disposition, readPoint, bizLocation)
 - Event metadata (type, action, transformationId)
-- References to FILESTREAM blobs (BlobId for per-event, CaptureId for per-capture)
 
 Purpose:
 - Preserve full EPCIS query flexibility
@@ -75,7 +92,7 @@ Purpose:
 
 ---
 
-### Blob Storage (SQL Server FILESTREAM)
+### Blob Storage (SQL Server FILESTREAM) - Option B Only
 
 Stored in SQL Server FILESTREAM (on NTFS, transactional):
 
@@ -96,9 +113,13 @@ Purpose:
 - Reduce CPU cost during queries (~90% reduction)
 - Transactional consistency (FILESTREAM participates in SQL transactions)
 
+> **Implementation Note:** EventBlobId and DocumentBlobId fields do not exist in the current schema. Phase 2 requires EF Core migrations to add these nullable foreign key columns.
+
 ---
 
-## Query Handling Strategy
+## Query Handling Strategy (Option B - Blob Storage)
+
+This strategy applies when blob storage (Option B) is chosen based on Phase 1 validation.
 
 | Query Type | Execution Path |
 |-----------|----------------|
@@ -106,7 +127,7 @@ Purpose:
 | **Result identification** | SQL returns list of EventIds matching criteria |
 | **XML response (small result sets <100 events)** | Fetch per-event blobs via FILESTREAM (10 events → 10 blob reads) |
 | **XML response (large result sets >100 events)** | Fetch per-capture blobs, stream response (1 blob read for entire capture) |
-| **JSON responses** | Fetch per-event XML blobs → transform to JSON (or cache JSON variant) |
+| **JSON responses** | Fetch per-event XML blobs → transform to JSON |
 | **Compliance exports** | Fetch per-capture blob (original EPCIS document, unmodified) |
 
 **Query Optimizer Logic:**
@@ -123,8 +144,10 @@ Else:
 - CPU: Major reduction (~90% less field reconstruction)
 - Memory: Major reduction (no in-memory object graphs for serialization)
 
-**Uncertainty:** 
+**Uncertainty:**
  - Optimal thresholds and crossover points may be workload‑dependent.
+
+> **JSON Response Note:** Current JSON formatting uses Field entity reconstruction (same as XML). With blob storage, JSON paths could either parse XML blobs on-the-fly, maintain Field-based reconstruction for JSON only, or store separate JSON blobs. Decision deferred to implementation phase based on JSON query volume analysis.
 
 ---
 
@@ -136,22 +159,106 @@ Else:
 Remove clearly sub‑optimal behaviors without architectural change.
 
 **Changes**
-- Fix configuration bugs (`Constants.cs:6` - CaptureSizeLimit incorrectly set to 1 KB)
+- Fix configuration bugs:
+  - `src/FasTnT.Domain/Constants.cs:6` - CaptureSizeLimit set to 1 KB (may be intentionally conservative, verify deployment requirements)
+  - `src/FasTnT.Host/Endpoints/Interfaces/CaptureDocumentRequest.cs:16` - **Critical bug:** Validation compares `ContentLength` to `MaxEventsReturnedInQuery` (20,000) instead of `CaptureSizeLimit`. This effectively limits requests to 20 KB, not the intended limit, and displays incorrect error message
 - Remove O(n²) field reconstruction bottleneck:
-  - **Code:** `XmlEventFormatter.FormatField:221-229` (recursive ParentIndex lookup)
+  - **Code:** `src/FasTnT.Host/Communication/Xml/Formatters/XmlEventFormatter.cs:221-229` (recursive ParentIndex lookup)
   - **Fix:** Pre-group fields by ParentIndex using `Dictionary<int, List<Field>>` → O(n) lookup instead of O(n²) linear scans
-- Reduce EF Core transaction overhead:
-  - **Code:** `CaptureHandler.StoreAsync:66` (dual SaveChangesAsync calls)
-  - **Fix:** Single SaveChangesAsync with RecordTime set before persistence
+  - **Note:** Similar pattern exists in `src/FasTnT.Host/Communication/Json/Formatters/JsonEventFormatter.cs` methods (lines 285-313)
+- Add database indexes for query performance:
+  - **Code:** `src/FasTnT.Application/Database/EpcisModelConfiguration.cs`
+  - **Add:** Indexes on `Event.BusinessStep`, `Event.Disposition`, `Event.EventTime`, `Event.Request.UserId` (multi-tenancy)
+  - **Critical:** Index on `Field.ParentIndex` (required for O(n²) fix effectiveness)
+- Apply EF Core 10 optimizations:
+  - **Compiled Queries:** Pre-compile repeated query patterns in `src/FasTnT.Application/Database/DataSources/EventQueryContext.cs` (10-30% query improvement)
+  - **AsNoTrackingWithIdentityResolution:** For complex event queries with shared references
 
 **Benefits**
-- Noticeable performance improvement in capture (expected ~30–40%)
+- Noticeable performance improvement in queries and capture (expected ~40–60%)
 - No architectural change
 - Zero operational impact
 
+**Note - Dual SaveChangesAsync Pattern:** The dual `SaveChangesAsync` in `CaptureHandler.cs` is EPCIS spec-compliant (RecordTime must be set by repository after insertion) and should not be optimized.
+
+**Phase 1 Validation - Bottleneck Analysis:**
+Before proceeding to Phase 2, benchmark and quantify the actual performance bottlenecks:
+1. **Serialization Cost:** Measure time spent in `XmlEventFormatter.FormatField` and `JsonEventFormatter.BuildElement`
+2. **SQL Query Cost:** Measure time spent in database queries (`EventQueryContext` filtering)
+3. **Field Loading Cost:** Measure time spent loading Field entities from database
+4. **Comparison:** Calculate percentage breakdown to confirm serialization is the dominant bottleneck
+
+This data validates whether blob storage (Phase 2) is the correct investment vs. alternative strategies (caching, further SQL optimization). Expected finding: serialization accounts for 60-80% of query response time, justifying blob storage approach.
+
 **Trade-offs if stopping here**
-- High peak memory usage remains
-- Large captures still slow and fragile
+- High peak memory usage remains for large result sets
+- Large captures still memory-intensive (blob storage helps, but streaming parser needed for full optimization)
+
+---
+
+## Alternative Phase 2A — Azure Redis Distributed Cache
+
+**Intent**
+Provide a caching layer that delivers performance improvements without architectural complexity or schema changes.
+
+**Changes**
+- Add Azure Cache for Redis (Standard C2+ tier)
+- Implement QueryCacheService using IDistributedCache interface
+- Cache complete XML/JSON responses keyed by: `epcis:query:{userId}:{format}:{queryHash}`
+- Integrate cache check into query endpoints (GET /events, GET /queries/{name})
+- Implement TTL strategy: 5-30 minutes based on query type (time-bounded vs open-ended)
+- Graceful degradation: cache failures fall back to normal query path (no user errors)
+
+**Cache Flow:**
+```
+Query Request → Check Redis → Cache HIT (1-5 ms) OR Cache MISS (SQL query + format + store)
+```
+
+**Technology Stack:**
+- Azure Cache for Redis (managed service)
+- Microsoft.Extensions.Caching.StackExchangeRedis NuGet package
+- New service: `src/FasTnT.Application/Services/QueryCacheService.cs`
+- Modify: `src/FasTnT.Host/Endpoints/EventsEndpoints.cs`, `QueriesEndpoints.cs`
+
+**Benefits**
+- **Cache hit performance:** Near-zero latency (1-5 ms vs 500-2000 ms for query+format)
+- **Cache miss performance:** Same as current (no degradation)
+- **No schema changes:** No migrations, no storage overhead
+- **Simpler implementation:** 2-3 weeks vs 6-10 weeks for blob storage
+- **Expected hit rate:** 40-70% for typical workloads (dashboards, compliance queries)
+
+**Operational Cost**
+- Azure Redis pricing: ~$55-200/month (Standard C2-C3 or Premium P1)
+- No SQL storage overhead (cache is separate)
+- Monitoring via Application Insights (hit rate, latency, eviction rate)
+- Operational complexity: Low (managed service, no schema changes)
+
+**Trade-offs**
+- Eventually consistent (1-30 min TTL, configurable by query type)
+- Cache misses have same performance as current (no improvement until cached)
+- Operational cost (Azure Redis vs SQL storage for blob approach)
+- Cache warm-up period (first queries populate cache)
+
+**Decision Criteria - Based on Phase 1 Bottleneck Analysis:**
+
+The choice between Redis cache and blob storage depends on the **actual bottleneck** identified in Phase 1 validation:
+
+**If Serialization is the Bottleneck (60-80% of query time):**
+- **Blob Storage (Phase 2)** is the right solution → Stores pre-serialized XML, eliminates reconstruction
+- Redis cache helps for repetitive queries, but doesn't solve the underlying problem
+- Benefit: 90% improvement for ALL queries (not just cache hits)
+
+**If SQL Query is the Bottleneck (>40% of query time):**
+- **Redis Cache (Phase 2A)** is the right solution → Bypasses SQL entirely for cache hits
+- Blob storage doesn't help → Still requires SQL query to find which blobs to retrieve
+- Benefit: Near-zero latency for cache hits, no benefit for cache misses
+
+**Additional Considerations:**
+- **Repetitive query patterns:** Redis cache more effective (higher hit rate)
+- **Unpredictable query patterns:** Blob storage more effective (helps all queries, not just hits)
+- **Consistency requirements:** Blob storage offers transactional consistency, Redis is eventually consistent (TTL)
+
+**Expected Finding:** Phase 1 benchmarks should confirm serialization is 60-80% of query time, validating blob storage as the correct approach.
 
 ---
 
@@ -413,6 +520,11 @@ operational constraints, observed usage patterns, and compliance requirements.
 - Cost/benefit analysis: SQL licensing vs. Cosmos DB RU costs
 - Query pattern analysis: When do document queries dominate over relational joins?
 
+### MasterData Queries
+- **Status:** Out of scope for this document
+- MasterData volumes are typically smaller and may not require blob optimization
+- Can be revisited if performance issues are observed
+
 These topics are explicitly acknowledged as future design decisions and do not invalidate
 the phased migration strategy described in this document.
 
@@ -420,26 +532,112 @@ the phased migration strategy described in this document.
 
 ## Final Recommendation
 
-Adopt a **Hybrid architecture with phased migration**:
-- **Phase 1 (2-3 weeks):** Algorithmic optimizations → expected 30-40% improvement
-- **Phase 2 (6-10 weeks):** SQL Server FILESTREAM dual blob storage with dual-read mode → expected 90% query improvement for new data (no capture improvement)
-- **Phase 3 (optional, 1-6 months):** Backfill existing data → uniform performance for all data, retire legacy code
-- **Phase 4 (optional, 4-6 weeks):** Streaming parser → expected 80-86% capture improvement
+### Recommended Phased Approach
 
-**Storage Strategy:** SQL Server FILESTREAM (transactional, single platform, proven at scale)
+**Phase 1 (2-3 weeks) - Foundational Optimizations** ✅ **ALL DEPLOYMENTS**
+- Algorithmic optimizations (O(n²) fix for XML/JSON formatters)
+- Database indexing (BusinessStep, Disposition, EventTime, ParentIndex, UserId)
+- EF Core 10 optimizations (compiled queries, identity resolution)
+- Configuration bug fixes (CaptureSizeLimit validation)
+- **Expected improvement:** 40-60% (updated from 30-40%)
+- **Validation gate:** Benchmark serialization vs SQL query breakdown
 
-**Deployment Strategy:** Dual-read mode enables immediate Phase 2 deployment without backfill
+---
 
-**Async capture:** Optional enhancement, EPCIS-compliant (full XSD validation before 202)
+### Phase 2 Decision Point - Choose Based on Deployment Context
 
-**Total timeline:** 2-3 months for focused team to reach production-ready Phase 2
+After Phase 1 benchmarking, choose one of three paths:
+
+#### **Path A: Azure Redis Cache** (Recommended for most deployments)
+- **Timeline:** 2-3 weeks
+- **Use if:**
+  - ✅ Repetitive query patterns (cache hit rate >50%)
+  - ✅ Want operational simplicity (no schema changes)
+  - ✅ Budget allows Azure Redis (~$50-200/month)
+- **Benefits:**
+  - Near-zero latency for cache hits (1-5 ms)
+  - No storage overhead
+  - Faster implementation
+- **Trade-offs:**
+  - Eventually consistent (1-15 min TTL)
+  - Cache misses same as current performance
+  - Operational cost (Azure Redis pricing)
+
+#### **Path B: SQL Server FILESTREAM Blob Storage** (For high consistency needs)
+- **Timeline:** 6-10 weeks
+- **Use if:**
+  - ✅ Need strong consistency (transactional blob + SQL)
+  - ✅ Very large documents (>100 MB)
+  - ✅ Unpredictable query patterns (low cache hit rate)
+- **Benefits:**
+  - 90% query improvement for all queries (not just cache hits)
+  - Transactional consistency (atomic blob + SQL commits)
+  - Lower long-term storage cost vs Redis
+- **Trade-offs:**
+  - +200-300% storage overhead (dual blobs)
+  - Complex implementation (migrations, dual-read logic)
+
+#### **Path C: Hybrid (Redis + Blob Storage)** (For high-scale SQL Server deployments)
+- **Timeline:** 8-13 weeks (Redis first, then blobs)
+- **Use if:**
+  - ✅ SQL Server with very high query volume
+  - ✅ Need best possible performance
+  - ✅ Can manage increased operational complexity
+  - ✅ Budget allows both Redis + storage overhead
+- **Benefits:**
+  - Best of both: cache hot data, blobs for consistency
+  - 1-5 ms for cache hits, 90% improvement for cache misses
+- **Trade-offs:**
+  - Highest operational complexity
+  - Highest cost (Redis + storage)
+
+---
+
+### Optional Phases (After Phase 2)
+
+**Phase 3 (optional, 1-6 months):** Backfill existing data
+- Only for Path B (blob storage)
+- Uniform performance for historical data
+- Can skip if dual-read acceptable
+
+**Phase 4 (optional, 4-6 weeks):** Streaming capture parser
+- For extreme-scale documents (>500 MB)
+- 80-86% capture improvement
+- Reduces memory from 300-500 MB to 10-20 MB
+
+---
+
+### Decision Framework
+
+**Start Here:** Always begin with **Phase 1** (all deployments benefit)
+
+**Then Choose:**
+
+| Scenario | Recommended Path | Timeline |
+|----------|-----------------|----------|
+| Repetitive query patterns | **Path A (Redis Cache)** | 4-6 weeks total |
+| Unpredictable query patterns | **Path B (Blob Storage)** | 8-13 weeks total |
+| Very high query volume | **Path C (Hybrid)** | 10-16 weeks total |
+| Budget-constrained | **Phase 1 only** (40-60% improvement) | 2-3 weeks |
+
+**Recommendation for Most Users:**
+1. **Phase 1** (2-3 weeks) - Algorithmic fixes + indexing
+2. **Benchmark** (1 week) - Measure serialization vs SQL, estimate cache hit rate
+3. **Phase 2A (Redis Cache)** (2-3 weeks) - If cache hit rate >50%
+4. **Evaluate:** If Redis insufficient, add Phase 2B (blob storage) later
+
+This incremental approach minimizes risk and delivers value faster (4-6 weeks vs 8-13 weeks for blob storage).
+
+---
+
+### Summary
 
 This strategy:
-- Preserves EPCIS query semantics (no functionality loss)
-- Delivers major performance gains (Phase 2 sufficient for most workloads)
-- Uses existing SQL Server infrastructure (no new platforms)
-- Enables immediate deployment with graceful degradation (dual-read mode)
-- Makes backfilling truly optional (Phase 3)
+- ✅ Preserves EPCIS query semantics (no functionality loss)
+- ✅ Delivers major performance gains (40-60% Phase 1, up to 95%+ with caching)
+- ✅ Enables validation gates (benchmark before committing to Phase 2)
+- ✅ Offers flexible stopping points based on actual needs
+- ✅ Minimizes implementation risk (start simple, add complexity only if needed)
 
 ---
 
