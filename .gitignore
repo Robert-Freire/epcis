@@ -26,3 +26,5 @@ obj
 # BenchmarkDotNet files
 **/BenchmarkDotNet.Artifacts/*.log
 **/BenchmarkDotNet.Artifacts/results/*
+.claude/settings.local.json
+Perf analysis/Prompts/*
