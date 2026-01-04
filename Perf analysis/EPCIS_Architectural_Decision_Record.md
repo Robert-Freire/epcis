@@ -537,6 +537,297 @@ SQL Server FILESTREAM provides transactional consistency between SQL metadata an
 
 ---
 
+## Error Recovery and Compensation Logic (Phase 2B)
+
+### Overview
+
+Phase 2B (Hybrid Storage with Azure Blob Storage) introduces **eventual consistency challenges** because Azure Blob Storage and Azure SQL Database cannot participate in the same distributed transaction. This section documents the error recovery strategy and compensation logic.
+
+### Error Scenarios and Recovery Strategies
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CAPTURE REQUEST ARRIVES                       │
+│              (XML/JSON document via POST /Capture)               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │  Parse & Validate  │
+                    │   (in-memory)      │
+                    └────────────────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │ Check Document Size│
+                    └────────────────────┘
+                              │
+                ┌─────────────┴─────────────┐
+                │                           │
+         < 5 MB │                           │ >= 5 MB
+                ▼                           ▼
+    ┌──────────────────────┐    ┌──────────────────────┐
+    │   INLINE PATH        │    │    BLOB PATH         │
+    │  (Fast, Transacted)  │    │  (Two-Phase Commit)  │
+    └──────────────────────┘    └──────────────────────┘
+                │                           │
+                ▼                           ▼
+    ┌──────────────────────┐    ┌──────────────────────┐
+    │ SQL Transaction:     │    │ PHASE 1:             │
+    │ - Save Request       │    │ Upload to Blob       │
+    │ - Save Events        │    │ Storage              │
+    │ - Store Serialized   │    │                      │
+    │   Document in JSON   │    └──────────────────────┘
+    │   column             │                │
+    └──────────────────────┘                ▼
+                │                   ┌────────────────┐
+                │                   │ Success?       │
+                │                   └────────────────┘
+                │                           │
+                │                 ┌─────────┴─────────┐
+                │                 │                   │
+                │               YES                  NO
+                │                 │                   │
+                │                 ▼                   ▼
+                │      ┌──────────────────┐  ┌───────────────┐
+                │      │ PHASE 2:         │  │ Return HTTP   │
+                │      │ SQL Transaction: │  │ 500 Error     │
+                │      │ - Save Request   │  │ (No cleanup   │
+                │      │ - Save Events    │  │  needed -     │
+                │      │ - Store Blob URI │  │  blob upload  │
+                │      │ - Set StorageType│  │  is idempotent│
+                │      └──────────────────┘  └───────────────┘
+                │                 │
+                │                 ▼
+                │         ┌────────────────┐
+                │         │ Success?       │
+                │         └────────────────┘
+                │                 │
+                │       ┌─────────┴─────────┐
+                │       │                   │
+                │     YES                  NO
+                │       │                   │
+                ▼       ▼                   ▼
+    ┌──────────────────────┐    ┌──────────────────────┐
+    │ Return HTTP 200 OK   │    │ COMPENSATION:        │
+    │ (Success)            │    │ - Delete Blob        │
+    └──────────────────────┘    │ - Return HTTP 500    │
+                                └──────────────────────┘
+```
+
+### Detailed Error Scenarios
+
+#### Scenario 1: Inline Storage Path (< 5 MB)
+
+**Error:** SQL transaction fails (constraint violation, timeout, connection error)
+
+**Recovery:**
+- Transaction automatically rolled back by SQL Server
+- No external state to clean up
+- Return HTTP 500 error to client
+- Client can retry request
+
+**Result:** Strong consistency guaranteed (ACID transaction)
+
+#### Scenario 2: Blob Storage Path - Phase 1 Failure (>= 5 MB)
+
+**Error:** Blob upload fails (network error, Azure Blob Storage unavailability, quota exceeded)
+
+**Recovery:**
+- No SQL transaction started yet
+- No cleanup needed (no blob created)
+- Return HTTP 500 error to client with error details
+- Client can retry request
+
+**Result:** No orphaned resources
+
+#### Scenario 3: Blob Storage Path - Phase 2 Failure (>= 5 MB)
+
+**Error:** SQL transaction fails after successful blob upload
+
+**Recovery (Compensation Logic):**
+```csharp
+try
+{
+    // Phase 1: Upload blob
+    var blobUri = await _azureBlobService.UploadDocumentAsync(document);
+
+    try
+    {
+        // Phase 2: SQL transaction
+        using var transaction = await _context.Database.BeginTransactionAsync();
+
+        var request = new Request
+        {
+            StorageType = StorageType.BlobStorage,
+            DocumentBlobUri = blobUri,
+            // ... other fields
+        };
+
+        _context.Requests.Add(request);
+        _context.Events.AddRange(events);
+
+        await _context.SaveChangesAsync();
+        await transaction.CommitAsync();
+
+        return Ok();
+    }
+    catch (Exception sqlException)
+    {
+        // COMPENSATION: Delete orphaned blob
+        try
+        {
+            await _azureBlobService.DeleteBlobAsync(blobUri);
+            _logger.LogWarning("Deleted orphaned blob {BlobUri} after SQL transaction failure", blobUri);
+        }
+        catch (Exception deleteException)
+        {
+            // Blob deletion failed - orphaned blob will be cleaned up by background service
+            _logger.LogError(deleteException,
+                "Failed to delete orphaned blob {BlobUri}. Will be cleaned by background service.",
+                blobUri);
+        }
+
+        throw; // Return HTTP 500 to client
+    }
+}
+catch (Exception blobException)
+{
+    _logger.LogError(blobException, "Blob upload failed");
+    throw; // Return HTTP 500 to client
+}
+```
+
+**Result:** Best-effort compensation with background cleanup fallback
+
+#### Scenario 4: Orphaned Blob (Compensation Failed)
+
+**Error:** Blob uploaded successfully, SQL transaction failed, compensation deletion also failed
+
+**Recovery (Background Service):**
+- Orphaned Blob Cleanup Service (Issue #20) runs every 24 hours
+- Identifies blobs not referenced in SQL database
+- Deletes blobs older than 7 days (configurable threshold)
+- Logs cleanup operations for audit
+
+```csharp
+// Simplified background service logic
+var allBlobs = await _azureBlobService.ListBlobsAsync();
+var referencedUris = await _context.Requests
+    .Where(r => r.StorageType == StorageType.BlobStorage)
+    .Select(r => r.DocumentBlobUri)
+    .ToListAsync();
+
+var orphanedBlobs = allBlobs
+    .Where(blob => !referencedUris.Contains(blob.Uri))
+    .Where(blob => blob.CreatedOn < DateTime.UtcNow.AddDays(-7));
+
+foreach (var orphan in orphanedBlobs)
+{
+    await _azureBlobService.DeleteBlobAsync(orphan.Uri);
+    _logger.LogInformation("Cleaned up orphaned blob {BlobUri} (age: {Age} days)",
+        orphan.Uri,
+        (DateTime.UtcNow - orphan.CreatedOn).TotalDays);
+}
+```
+
+**Result:** Eventually consistent cleanup (within 7-31 days)
+
+### Query Path Error Handling
+
+#### Scenario 5: Blob Download Failure During Query
+
+**Error:** SQL query succeeds, but blob download fails (blob deleted, Azure unavailable, network error)
+
+**Recovery:**
+```csharp
+try
+{
+    var request = await _context.Requests
+        .Where(r => r.Id == requestId)
+        .FirstOrDefaultAsync();
+
+    if (request.StorageType == StorageType.BlobStorage)
+    {
+        try
+        {
+            var document = await _azureBlobService.DownloadBlobAsync(request.DocumentBlobUri);
+            return Ok(document);
+        }
+        catch (BlobNotFoundException)
+        {
+            _logger.LogError("Blob not found: {BlobUri} for Request {RequestId}",
+                request.DocumentBlobUri, requestId);
+            return StatusCode(500, "Document storage corrupted - blob not found");
+        }
+        catch (Exception blobException)
+        {
+            _logger.LogError(blobException, "Failed to download blob {BlobUri}", request.DocumentBlobUri);
+            return StatusCode(503, "Temporary storage unavailability - retry later");
+        }
+    }
+    else
+    {
+        // Inline storage - no external dependency
+        return Ok(request.SerializedDocument);
+    }
+}
+catch (Exception ex)
+{
+    _logger.LogError(ex, "Query failed");
+    return StatusCode(500, "Internal server error");
+}
+```
+
+**Result:**
+- HTTP 500 if blob permanently missing (data corruption)
+- HTTP 503 if temporary Azure unavailability (client can retry)
+
+### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Two-phase commit (blob first, SQL second)** | Blob upload is slower; fail fast if blob upload fails before starting SQL transaction |
+| **Synchronous compensation (delete blob on SQL failure)** | Immediate cleanup reduces orphaned blob count; background service is fallback only |
+| **7-day orphan threshold** | Balances cleanup aggressiveness with debugging/audit window |
+| **24-hour cleanup interval** | Low operational cost; orphaned blobs are rare (only on SQL failures) |
+| **Idempotent blob upload** | Same blobUri for retry allows client retries without duplicate blobs |
+| **HTTP 503 for transient errors, 500 for permanent** | Enables client retry logic vs. permanent failure handling |
+
+### Monitoring and Alerting
+
+**Key Metrics:**
+- Blob upload failures (Phase 1 errors)
+- SQL transaction failures after blob upload (Phase 2 errors requiring compensation)
+- Compensation deletion failures (triggers background cleanup)
+- Orphaned blob count (tracked by background service)
+- Blob download failures during queries
+
+**Recommended Alerts:**
+- Alert if orphaned blob count > 100 (indicates systemic SQL transaction failures)
+- Alert if blob download failure rate > 1% (indicates storage corruption or Azure issues)
+- Alert if compensation deletion failure rate > 10% (indicates Azure Blob Storage issues)
+
+### Testing Strategy
+
+**Unit Tests:**
+- Mock blob service to simulate upload/download failures
+- Verify compensation logic executes
+- Verify error codes returned to client
+
+**Integration Tests:**
+- Use Azurite (Azure Blob Storage emulator)
+- Simulate Azure unavailability (stop Azurite mid-transaction)
+- Verify orphaned blob cleanup service
+
+**Chaos Testing:**
+- Random blob upload failures (1% rate)
+- Random SQL transaction failures (1% rate)
+- Azure Blob Storage network partitions
+- Verify system recovers gracefully
+
+---
+
 ## Remaining Open Questions
 
 - **Phase 1 validation results:** What is the actual bottleneck breakdown (serialization % vs SQL query %)?

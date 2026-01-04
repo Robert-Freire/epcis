@@ -611,6 +611,195 @@ This analysis determines whether to use intelligent routing (Hybrid Storage) or 
 
 ---
 
+## Azure Deployment Requirements for Phase 2B Testing
+
+### Overview
+
+Phase 2B-Azure validation requires **real Azure resources** to accurately measure performance, network latency, and operational characteristics. Local development with Azurite (Azure Blob Storage emulator) can be used for functional testing, but **performance benchmarks must run against real Azure infrastructure** in the target deployment region.
+
+### Required Azure Resources
+
+| Resource | Tier/SKU | Purpose | Estimated Cost (West Europe) |
+|----------|----------|---------|------------------------------|
+| **Azure SQL Database** | S3 (100 DTU) | Production-equivalent database for realistic performance metrics | €300-400/month |
+| **Azure Blob Storage** | Standard LRS, Hot tier | Blob storage for large documents (>= 5 MB) | €0.03/GB/month (~€1-10/month for testing) |
+| **Azure App Service** (Optional) | S1 tier | Host benchmark application if testing end-to-end latency | €70/month |
+
+**Total Estimated Cost:** €300-480/month (minimum ~2 weeks for Phase 2B validation = €150-240 one-time cost)
+
+### Development vs. Production Testing Environments
+
+| Environment | Database | Blob Storage | Use Case |
+|-------------|----------|--------------|----------|
+| **Local Development** | SQL Server Developer Edition (free) | Azurite (free emulator) | Functional testing, debugging, unit tests |
+| **CI/CD Pipeline** | SQLite (in-memory) | Azurite (free emulator) | Automated integration tests |
+| **Performance Benchmarks** | Azure SQL Database S3 | Azure Blob Storage (Hot tier) | **REQUIRED** - Realistic performance metrics |
+| **Production** | Azure SQL Database S3+ | Azure Blob Storage (Hot tier) | Production deployment |
+
+**Critical:** Performance benchmarks (BenchmarkDotNet) **must run against real Azure resources** to provide accurate metrics. Azurite introduces artificial latency and does not reflect production network characteristics.
+
+### Azure Resource Provisioning for Benchmarks
+
+#### Option 1: Dedicated Benchmark Environment (Recommended)
+
+Create a separate Azure resource group for benchmarks:
+
+```bash
+# Create resource group
+az group create --name rg-fastnt-benchmarks --location westeurope
+
+# Create Azure SQL Database (S3 tier)
+az sql server create --name sql-fastnt-bench --resource-group rg-fastnt-benchmarks --location westeurope --admin-user benchadmin --admin-password <secure-password>
+az sql db create --resource-group rg-fastnt-benchmarks --server sql-fastnt-bench --name fastnt-bench --service-objective S3
+
+# Create Azure Blob Storage
+az storage account create --name stfastntbench --resource-group rg-fastnt-benchmarks --location westeurope --sku Standard_LRS --kind StorageV2 --access-tier Hot
+az storage container create --name epcis-documents --account-name stfastntbench
+```
+
+**Benefits:**
+- Isolated from production
+- Can be deleted after benchmarks complete to save costs
+- Clear cost tracking
+
+**Cost Management:**
+- Delete resources immediately after Phase 2B validation completes (~2 weeks)
+- Use Azure Calculator to estimate costs: https://azure.microsoft.com/pricing/calculator/
+
+#### Option 2: Shared Development Environment (Cost-Saving)
+
+Use the same Azure resources for both development and benchmarks:
+
+**Caution:**
+- Benchmarks may interfere with development work (database load, blob storage operations)
+- Less accurate performance metrics if other processes are running
+- Not recommended for final validation benchmarks
+
+### Connection String Configuration
+
+Update `appsettings.Benchmarks.json` with Azure connection strings:
+
+```json
+{
+  "ConnectionStrings": {
+    "FasTnT.Database": "Server=sql-fastnt-bench.database.windows.net;Database=fastnt-bench;User Id=benchadmin;Password=<password>;"
+  },
+  "FasTnT": {
+    "Database": {
+      "Provider": "SqlServer"
+    },
+    "Storage": {
+      "SizeThresholdBytes": 5242880,
+      "BlobStorage": {
+        "AccountUri": "https://stfastntbench.blob.core.windows.net",
+        "ContainerName": "epcis-documents",
+        "AccountKey": "<storage-account-key>"
+      }
+    }
+  }
+}
+```
+
+**Security:**
+- Do NOT commit connection strings to Git
+- Use Azure Key Vault or User Secrets for sensitive values
+- Use Managed Identity in App Service deployments (no connection strings needed)
+
+### Network Latency Considerations
+
+**Azure Region Selection:**
+- Run benchmarks in the **same Azure region** as planned production deployment
+- Network latency varies significantly by region:
+  - Same region: 1-5 ms
+  - Same continent, different region: 10-50 ms
+  - Different continents: 100-300 ms
+
+**Benchmark Accuracy:**
+- Blob upload/download latency is **highly region-dependent**
+- Use same region for SQL Database and Blob Storage (co-location)
+- Document expected latency ranges in benchmark results (e.g., "West Europe: 2-3 ms average")
+
+### Pre-Benchmark Checklist
+
+Before running Phase 2B benchmarks on Azure:
+
+- [ ] Azure SQL Database S3 tier provisioned in target region
+- [ ] Azure Blob Storage (Hot tier) provisioned in same region
+- [ ] Firewall rules configured to allow benchmark machine access
+- [ ] Connection strings updated in `appsettings.Benchmarks.json`
+- [ ] EF Core migrations applied to Azure SQL Database: `dotnet ef database update`
+- [ ] Test connection: `dotnet run --project tests/FasTnT.PerformanceTests -- --list`
+- [ ] Confirm no active workload on Azure resources (isolated environment)
+- [ ] Enable Azure Monitor / Application Insights (optional, for detailed metrics)
+
+### Running Benchmarks on Azure
+
+```bash
+cd tests/FasTnT.PerformanceTests
+
+# Run Phase 2B benchmarks against Azure resources
+dotnet run -c Release --filter *HybridStorageBenchmarks* --memory --exporters json md --artifacts artifacts/phase2b-azure
+
+# Run Azure Blob latency benchmarks
+dotnet run -c Release --filter *AzureBlobLatencyBenchmarks* --memory --exporters json md --artifacts artifacts/phase2b-azure-latency
+
+# Run threshold boundary tests
+dotnet run -c Release --filter *ThresholdBoundaryBenchmarks* --memory --exporters json md --artifacts artifacts/phase2b-azure-threshold
+```
+
+**Important:**
+- Benchmarks will create real blobs in Azure Blob Storage
+- Benchmarks will insert/query data in Azure SQL Database
+- Clean up test data after benchmarks complete (or delete resource group)
+
+### Cost Optimization Strategies
+
+1. **Time-Bound Testing:**
+   - Provision Azure resources only during benchmark execution (~2 weeks)
+   - Delete resources immediately after validation completes
+   - Estimated cost: €150-240 (2 weeks of S3 database + storage)
+
+2. **Use Lower Tiers for Early Testing:**
+   - Start with Azure SQL Database S2 tier (€150/month) for initial functional testing
+   - Upgrade to S3 tier only for final performance validation
+   - Use Cool tier Blob Storage for non-performance tests (€0.01/GB/month vs €0.0168/GB/month)
+
+3. **Scheduled Start/Stop (SQL Database only):**
+   - Azure SQL Database cannot be paused, but you can scale down to Basic tier when not in use
+   - Not recommended during active benchmark period (tier changes affect performance)
+
+4. **Reuse Existing Resources:**
+   - If you already have Azure SQL Database for development, use it for benchmarks
+   - Ensure no concurrent workload during benchmark execution
+
+### Post-Benchmark Cleanup
+
+After Phase 2B validation completes:
+
+```bash
+# Option 1: Delete entire resource group (fastest)
+az group delete --name rg-fastnt-benchmarks --yes --no-wait
+
+# Option 2: Keep database, delete only blobs
+az storage blob delete-batch --account-name stfastntbench --source epcis-documents
+
+# Option 3: Scale down database tier
+az sql db update --resource-group rg-fastnt-benchmarks --server sql-fastnt-bench --name fastnt-bench --service-objective Basic
+```
+
+### Expected Benchmark Execution Time on Azure
+
+| Benchmark Suite | Estimated Duration | Notes |
+|-----------------|-------------------|-------|
+| HybridStorageBenchmarks | 2-4 hours | Multiple document sizes, warmup iterations |
+| AzureBlobLatencyBenchmarks | 1-2 hours | Network latency sensitive, multiple sizes |
+| ThresholdBoundaryBenchmarks | 1-2 hours | Boundary testing (4.5 MB, 5.0 MB, 5.5 MB, etc.) |
+| **Total Phase 2B validation** | **4-8 hours** | Plus analysis and report generation time |
+
+**Recommendation:** Run benchmarks overnight or during off-hours to minimize cost impact.
+
+---
+
 ## Next Steps
 
 1. **Approve Phase 1 optimization approach**
