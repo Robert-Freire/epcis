@@ -1,19 +1,45 @@
 # EPCIS Performance Architecture — Hybrid Strategy & Phased Migration
 
+> **Performance Estimate Disclaimer**
+>
+> Performance improvements in this document (e.g., "40-60% improvement," "90% reduction")
+> are **estimates** based on architectural analysis and preliminary profiling.
+>
+> Actual results will vary based on:
+> - Event complexity (custom fields, ILMD depth, extension usage)
+> - Workload characteristics (query patterns, capture frequency, document size distribution)
+> - Infrastructure configuration (Azure region, tier selection, network latency)
+>
+> Phase 1 validation will establish concrete baseline metrics using the
+> FasTnT.PerformanceTests benchmark suite.
+
+> **Cost Estimation Disclaimer**
+>
+> Cost estimates in this document (e.g., "~€300/month," "~€360/month") are **examples** based on:
+> - West Europe region pricing (January 2025)
+> - Assumed low-volume workload (1,000 captures/month, 5% large documents)
+> - Azure SQL Database S3 tier (100 DTUs)
+>
+> **Your actual costs will vary** based on database size, captures/month, document size distribution, and query volume.
+> Use the [Cost Estimation Worksheet](EPCIS_Azure_Cost_Assumptions.md#cost-estimation-worksheet) to calculate costs for YOUR deployment.
+
 > **Code References:** File paths and line numbers in this document are accurate as of December 30, 2024. If line numbers have changed, search for the code pattern or function name described.
 
 ## Purpose
 
 This document defines the EPCIS performance optimization strategy using a **Hybrid architecture**:
-- **Normalized SQL Server tables** for query flexibility (all EPCIS query parameters)
-- **SQL Server FILESTREAM blobs** for performance (dual granularity: per-event + per-capture)
+- **Normalized Azure SQL Database tables** for query flexibility (all EPCIS query parameters)
+- **Intelligent routing based on document size** (configurable 5 MB threshold):
+  - Small documents (< 5 MB) → JSON column (SerializedDocument) in Azure SQL Database
+  - Large documents (>= 5 MB) → Azure Blob Storage with URI reference (DocumentBlobUri)
 - **Phased implementation** with clear validation gates
 
 The intent is to:
-- Improve performance incrementally (2-3 month timeline for Phase 1+2)
+- Improve performance incrementally (2-4 month timeline for Phase 1+2)
 - Preserve full EPCIS query semantics (no loss of functionality)
 - Make trade-offs explicit at each stopping point
 - Enable production deployment after Phase 2 (sufficient for most workloads)
+- Support 20,000 event documents (20-100 MB) with automatic blob routing
 
 This is a **design document**, not an implementation plan.
 
@@ -40,36 +66,36 @@ This is a **design document**, not an implementation plan.
 
 ## Target Architecture Options
 
-> **Note:** This document targets SQL Server deployments. The final architecture choice (Redis cache, blob storage, or hybrid) is determined after Phase 1 benchmarking validates the actual performance bottleneck.
+> **Note:** This document targets Azure PaaS deployments (Azure SQL Database + Azure Blob Storage). The final architecture choice (Redis cache, blob storage, or hybrid) is determined after Phase 1 benchmarking validates the actual performance bottleneck.
 
 ### Architecture Decision Framework
 
 **All deployments start with:**
-- SQL Server normalized tables (all queryable EPCIS fields indexed)
+- Azure SQL Database normalized tables (all queryable EPCIS fields indexed)
 - Full query flexibility preserved
 - Phase 1 optimizations applied (O(n²) fixes, database indexes, EF Core optimizations)
 
 **Phase 2 adds ONE of the following, based on Phase 1 validation:**
 
 **Option A: Redis Distributed Cache**
-- External Azure Redis cache layer
+- External Azure Cache for Redis layer
 - Caches complete XML/JSON responses (keyed by query parameters)
 - **Choose if:** SQL query execution is the bottleneck (>40% of query time)
 - **Benefit:** Near-zero latency for cache hits (1-5 ms), bypasses SQL entirely
 
-**Option B: SQL Server FILESTREAM Blob Storage**
-- Dual-granularity blob storage (per-event + per-capture)
-- **Per-event blobs:** Individual XML fragments (~20 KB each) for selective queries
-- **Per-capture blobs:** Complete EPCIS documents (~400 MB) for compliance/bulk retrieval
+**Option B-Azure: Hybrid Storage (JSON Columns + Blob Storage)**
+- Intelligent routing based on document size (configurable 5 MB threshold)
+- **Small documents (< 5 MB):** JSON column (SerializedDocument) in Azure SQL Database (~95% of workload)
+- **Large documents (>= 5 MB):** Azure Blob Storage with URI reference (DocumentBlobUri) (edge cases)
 - **Choose if:** Serialization is the bottleneck (60-80% of query time)
-- **Benefit:** Eliminates XML reconstruction for all queries (90% improvement)
+- **Benefit:** Estimated 90% query improvement for blob-stored documents, handles 20K event requirement
 
-**Option C: Hybrid (Both)**
-- Combines Redis cache + FILESTREAM blob storage
-- **Choose if:** Very high query volume, need best possible performance
-- **Benefit:** 1-5 ms for cache hits, 90% improvement for cache misses
+**Option C-Azure: Hybrid Storage + Redis**
+- Combines Azure Cache for Redis + Hybrid Storage (JSON columns + Blob Storage)
+- **Choose if:** Both bottlenecks are significant, very high query volume
+- **Benefit:** 1-5 ms for cache hits, estimated 90% improvement for cache misses
 
-**The Decision:** Phase 1 benchmarking (issue #16) measures the actual bottleneck breakdown to determine which option solves the real problem.
+**The Decision:** Phase 1 benchmarking measures the actual bottleneck breakdown to determine which option solves the real problem.
 
 ---
 
@@ -92,62 +118,73 @@ Purpose:
 
 ---
 
-### Blob Storage (SQL Server FILESTREAM) - Option B Only
+### Hybrid Storage (JSON Columns + Azure Blob Storage) - Option B-Azure Only
 
-Stored in SQL Server FILESTREAM (on NTFS, transactional):
+Stored using intelligent routing based on document size:
 
-**Per-Event Blobs:**
-- Individual event XML fragments (~20 KB each, compressed)
-- Enables selective retrieval (query 10 events → fetch 10 blobs, not entire document)
-- Referenced via `Event.EventBlobId` foreign key
+**Small Documents (< 5 MB):**
+- Stored in `SerializedDocument` JSON column in Azure SQL Database
+- Complete EPCIS document (XML or JSON format preserved)
+- Fast retrieval (inline with Request record, no external network call)
+- Handles typical documents with 1,000-5,000 events efficiently
 
-**Per-Capture Blobs:**
-- Complete EPCIS document as originally submitted (~400 MB for 20,000 events, compressed)
+**Large Documents (>= 5 MB):**
+- Stored in Azure Blob Storage
+- Complete EPCIS document as originally submitted (20-100 MB for 20,000 events)
+- URI stored in `DocumentBlobUri` column (reference to blob)
 - Preserves document context (EPCIS Header, MasterData, original structure)
-- Referenced via `Request.DocumentBlobId` foreign key
-- Used for compliance exports, auditing, full-document retrieval
+- Used for 20,000 event requirement and extreme-scale documents
+
+**Storage Type Tracking:**
+- `StorageType` enum field: Inline (0) or BlobStorage (1)
+- Enables dual-read logic (fetch from JSON column or blob based on type)
 
 Purpose:
-- Serve XML responses without reconstruction (eliminate O(n²) field formatting)
+- Serve responses without field reconstruction (eliminate O(n²) field formatting)
 - Preserve full EPCIS fidelity and extensions
-- Reduce CPU cost during queries (~90% reduction)
-- Transactional consistency (FILESTREAM participates in SQL transactions)
+- Reduce CPU cost during queries (estimated ~90% reduction for blob-stored documents)
+- Eventual consistency with compensation logic (two-phase commit for blob uploads)
+- Support 20,000 event documents without SQL performance degradation
 
-> **Implementation Note:** EventBlobId and DocumentBlobId fields do not exist in the current schema. Phase 2 requires EF Core migrations to add these nullable foreign key columns.
+> **Implementation Note:** SerializedDocument, DocumentBlobUri, and StorageType fields do not exist in the current schema. Phase 2B requires EF Core migrations to add these columns to the Request entity. See GitHub issues for detailed implementation examples.
 
 ---
 
-## Query Handling Strategy (Option B - Blob Storage)
+## Query Handling Strategy (Option B-Azure - Hybrid Storage)
 
-This strategy applies when blob storage (Option B) is chosen based on Phase 1 validation.
+This strategy applies when hybrid storage (Option B-Azure) is chosen based on Phase 1 validation.
 
 | Query Type | Execution Path |
 |-----------|----------------|
 | **Event filtering** (EQ_bizStep, GE_eventTime, etc.) | SQL query on normalized Event table |
-| **Result identification** | SQL returns list of EventIds matching criteria |
-| **XML response (small result sets <100 events)** | Fetch per-event blobs via FILESTREAM (10 events → 10 blob reads) |
-| **XML response (large result sets >100 events)** | Fetch per-capture blobs, stream response (1 blob read for entire capture) |
-| **JSON responses** | Fetch per-event XML blobs → transform to JSON |
-| **Compliance exports** | Fetch per-capture blob (original EPCIS document, unmodified) |
+| **Result identification** | SQL returns list of RequestIds matching criteria |
+| **Document retrieval (inline storage)** | Fetch from `SerializedDocument` JSON column (fast, same SQL query) |
+| **Document retrieval (blob storage)** | Fetch from Azure Blob Storage via `DocumentBlobUri` (network call) |
+| **Format conversion** | Return stored format (XML/JSON) or transform as needed |
+| **Compliance exports** | Fetch complete document (inline or blob based on `StorageType`) |
 
-**Query Optimizer Logic:**
+**Query Routing Logic:**
 ```
-If small result set:
-    Fetch per-event blobs (selective)
-Else:
-    Fetch per-capture blob (bulk)
+1. SQL query filters events (same as always)
+2. For each matching Request:
+   - Check StorageType field
+   - If Inline: Fetch from SerializedDocument column (fast path)
+   - If BlobStorage: Fetch from Azure Blob Storage via DocumentBlobUri (blob path)
+3. Return response
 ```
 
 **Trade-off:**
-- Storage: +200-300% (dual blobs)
-- I/O: Slight increase for blob retrieval (streaming, not full load)
-- CPU: Major reduction (~90% less field reconstruction)
-- Memory: Major reduction (no in-memory object graphs for serialization)
+- Storage: Estimated +45% (blended average: 95% inline, 5% blob)
+- I/O: Network call for blob-stored documents (5% of queries)
+- CPU: Major reduction (estimated ~90% less field reconstruction)
+- Memory: Major reduction (no in-memory Field entity object graphs for serialization)
+- Cost: €300-410/month (Azure SQL Database S3: €300-400 + Blob Storage: €0-10)
 
 **Uncertainty:**
- - Optimal thresholds and crossover points may be workload‑dependent.
+ - Optimal threshold (default 5 MB) may be workload-dependent
+ - Document size distribution will affect actual blob usage percentage
 
-> **JSON Response Note:** Current JSON formatting uses Field entity reconstruction (same as XML). With blob storage, JSON paths could either parse XML blobs on-the-fly, maintain Field-based reconstruction for JSON only, or store separate JSON blobs. Decision deferred to implementation phase based on JSON query volume analysis.
+> **Implementation Note:** High-level routing logic shown here. Detailed code examples and blob upload patterns (two-phase commit with compensation) will be documented in GitHub issues to keep this document focused on architecture decisions.
 
 ---
 
@@ -181,14 +218,39 @@ Remove clearly sub‑optimal behaviors without architectural change.
 
 **Note - Dual SaveChangesAsync Pattern:** The dual `SaveChangesAsync` in `CaptureHandler.cs` is EPCIS spec-compliant (RecordTime must be set by repository after insertion) and should not be optimized.
 
-**Phase 1 Validation - Bottleneck Analysis:**
-Before proceeding to Phase 2, benchmark and quantify the actual performance bottlenecks:
+**Phase 1 Validation - Two-Stage Gating Decision:**
+Before proceeding to Phase 2, perform two validation analyses to determine the optimal architecture:
+
+**Gate 1: Bottleneck Analysis**
+Benchmark and quantify the actual performance bottlenecks:
 1. **Serialization Cost:** Measure time spent in `XmlEventFormatter.FormatField` and `JsonEventFormatter.BuildElement`
 2. **SQL Query Cost:** Measure time spent in database queries (`EventQueryContext` filtering)
 3. **Field Loading Cost:** Measure time spent loading Field entities from database
-4. **Comparison:** Calculate percentage breakdown to confirm serialization is the dominant bottleneck
+4. **Comparison:** Calculate percentage breakdown to determine the dominant bottleneck
 
-This data validates whether blob storage (Phase 2) is the correct investment vs. alternative strategies (caching, further SQL optimization). Expected finding: serialization accounts for 60-80% of query response time, justifying blob storage approach.
+**Gate 1 Decision Criteria:**
+- **If SQL query >40% of query time** → Phase 2A (Redis Cache) - Bypasses SQL entirely on cache hits
+- **If serialization 60-80% of query time** → Proceed to Gate 2 (document size analysis)
+- **If both are significant** → Phase 2C-Azure (Hybrid Storage + Redis)
+
+**Gate 2: Document Size Distribution Analysis** *(Only if serialization is the bottleneck)*
+Analyze production or realistic test workload to understand document size patterns:
+1. **Capture document sizes:** Measure size distribution over representative workload (1,000+ captures)
+2. **Generate histogram:** Calculate percentages for size buckets (<1MB, 1-5MB, 5-10MB, 10-50MB, >50MB)
+3. **Identify P50, P90, P95, P99 percentiles:** Understand typical vs edge-case document sizes
+
+**Gate 2 Decision Criteria:**
+- **If high proportion of small documents (>80% < 5 MB)** → Phase 2B-Azure (Hybrid Storage with intelligent routing)
+  - **Benefit:** Most documents stay inline (fast SQL access), large documents routed to blob (handles edge cases)
+  - **Trade-off:** Dual code paths, but handles typical workload efficiently
+- **If high proportion of large documents (>50% >= 5 MB)** → Phase 2B-Azure-Simple (Blob-Only Storage)
+  - **Benefit:** Simpler implementation (single code path, all documents to blob)
+  - **Trade-off:** Network call for all documents, but avoids dual-path complexity
+- **If mixed distribution** → Tune threshold or choose based on operational preference
+
+**Expected Finding:**
+- Gate 1: Serialization accounts for 60-80% of query response time (justifying blob storage)
+- Gate 2: 90% of documents < 5 MB (justifying intelligent routing with 5 MB threshold)
 
 **Trade-offs if stopping here**
 - High peak memory usage remains for large result sets
@@ -228,7 +290,7 @@ Query Request → Check Redis → Cache HIT (1-5 ms) OR Cache MISS (SQL query + 
 - **Expected hit rate:** 40-70% for typical workloads (dashboards, compliance queries)
 
 **Operational Cost**
-- Azure Redis pricing: ~$55-200/month (Standard C2-C3 or Premium P1)
+- Azure Redis pricing: €55-110/month (Standard C2-C3)
 - No SQL storage overhead (cache is separate)
 - Monitoring via Application Insights (hit rate, latency, eviction rate)
 - Operational complexity: Low (managed service, no schema changes)
@@ -244,63 +306,70 @@ Query Request → Check Redis → Cache HIT (1-5 ms) OR Cache MISS (SQL query + 
 The choice between Redis cache and blob storage depends on the **actual bottleneck** identified in Phase 1 validation:
 
 **If Serialization is the Bottleneck (60-80% of query time):**
-- **Blob Storage (Phase 2)** is the right solution → Stores pre-serialized XML, eliminates reconstruction
+- **Hybrid Storage (Phase 2B-Azure)** is the right solution → Stores complete documents (inline or blob), eliminates field reconstruction
 - Redis cache helps for repetitive queries, but doesn't solve the underlying problem
-- Benefit: 90% improvement for ALL queries (not just cache hits)
+- Benefit: Estimated 90% improvement for ALL queries (not just cache hits)
 
 **If SQL Query is the Bottleneck (>40% of query time):**
 - **Redis Cache (Phase 2A)** is the right solution → Bypasses SQL entirely for cache hits
-- Blob storage doesn't help → Still requires SQL query to find which blobs to retrieve
+- Hybrid storage doesn't help → Still requires SQL query to find which documents to retrieve
 - Benefit: Near-zero latency for cache hits, no benefit for cache misses
 
 **Additional Considerations:**
 - **Repetitive query patterns:** Redis cache more effective (higher hit rate)
-- **Unpredictable query patterns:** Blob storage more effective (helps all queries, not just hits)
-- **Consistency requirements:** Blob storage offers transactional consistency, Redis is eventually consistent (TTL)
+- **Unpredictable query patterns:** Hybrid storage more effective (helps all queries, not just hits)
+- **Consistency requirements:** Hybrid storage offers eventual consistency with compensation logic, Redis is eventually consistent (TTL)
 
-**Expected Finding:** Phase 1 benchmarks should confirm serialization is 60-80% of query time, validating blob storage as the correct approach.
+**Expected Finding:** Phase 1 benchmarks should confirm serialization is 60-80% of query time, validating hybrid storage as the correct approach.
 
 ---
 
-### Phase 2 — Blob-Based Response Path (Stop Point B)
+### Phase 2B — Hybrid Storage (JSON Columns + Azure Blob Storage)
 
-**Intent**  
-Remove XML reconstruction from the query hot path.
+**Intent**
+Remove field reconstruction from the query hot path while supporting 20,000 event documents.
 
 **Changes**
-- Store EPCIS XML in SQL Server FILESTREAM storage with dual granularity:
-  - **Per-event blobs:** Individual event XML fragments (~20 KB each) for selective queries
-  - **Per-capture blobs:** Complete EPCIS document for compliance exports and full retrieval
+- Store complete EPCIS documents using intelligent routing:
+  - **Small documents (< 5 MB):** JSON column (SerializedDocument) in Azure SQL Database
+  - **Large documents (>= 5 MB):** Azure Blob Storage with URI reference (DocumentBlobUri)
 - Keep existing SQL normalization intact (all queryable fields indexed)
-- Serve XML responses directly from FILESTREAM (no reconstruction)
+- Serve responses directly from stored documents (no field reconstruction)
 - **Deploy with dual-read mode** to handle existing data:
   ```
   Query Logic:
   1. SQL query filters events (same as always)
-  2. For each matching event:
-     - Check if EventBlobId exists
-     - If YES: Fetch from FILESTREAM (fast path)
-     - If NO: Reconstruct from Field entities (legacy path for existing data)
+  2. For each matching Request:
+     - Check StorageType field
+     - If Inline: Fetch from SerializedDocument column (fast path)
+     - If BlobStorage: Fetch from Azure Blob Storage via DocumentBlobUri (blob path)
+     - If NULL (legacy): Reconstruct from Field entities (legacy path for existing data)
   3. Return response
   ```
 
+**Schema Changes:**
+- Add `SerializedDocument` nvarchar(max) column to Request table
+- Add `DocumentBlobUri` nvarchar(500) column to Request table
+- Add `StorageType` tinyint column to Request table (0=Inline, 1=BlobStorage)
+
 **Benefits**
-- **Query performance:** Eliminates recursive serialization cost (expected ~90% reduction in query response time for new data)
-- **Query memory:** Reduces memory usage by avoiding Field entity reconstruction, which otherwise creates large in-memory object graphs.
+- **Query performance:** Eliminates field reconstruction cost (estimated ~90% reduction in query response time for stored documents)
+- **Query memory:** Reduces memory usage by avoiding Field entity reconstruction, which otherwise creates large in-memory object graphs
 - **Preserves full query flexibility:** All EPCIS query parameters supported
-- **Transactional consistency:** FILESTREAM participates in SQL transactions (no reconciliation jobs)
-- **Supports scale:** 20,000-event documents efficiently (400+ MB, well within 2 GB FILESTREAM limit)
+- **Handles 20K events:** Documents with 20,000 events (20-100 MB) automatically routed to blob storage
+- **Handles typical documents:** 95% of documents stay inline (fast, no external network call)
+- **Eventual consistency:** Two-phase commit with compensation logic for blob uploads
 - **Immediate deployment:** No backfill required - graceful degradation for existing data
 
 **Capture Performance Impact**
-- **No improvement** in capture time (keeps all current normalization + adds blob writes)
-- May see slight increase in capture duration (+5-10%) due to blob write overhead
-- Capture optimization requires Phase 3 (streaming parser)
+- **No improvement** in capture time (keeps all current normalization + adds document storage)
+- May see slight increase in capture duration (+5-10%) due to JSON column or blob write overhead
+- Capture optimization requires Phase 4 (streaming parser)
 
 **Operational Cost**
-- Storage: +200-300% (dual blob storage: per-event + per-capture) for new data only
-- Disk I/O: Minimal increase (streaming access)
-- Operational complexity: +10-15% (simpler than external blob storage)
+- Storage: Estimated +45% (blended average: 95% inline in JSON column, 5% in blob storage) for new data only
+- Azure Blob Storage: ~€0.03/month for typical workloads (negligible)
+- Azure SQL Database: Same tier (S3 recommended, €300-400/month)
 - Code complexity: Dual-read paths must be maintained
 
 **Implementation Timeline:**
@@ -310,22 +379,25 @@ Remove XML reconstruction from the query hot path.
 - Excellent query performance gains for new data
 - Performance inconsistent (new data fast, old data slow)
 - Legacy reconstruction code must be maintained
-- Capture remains slow for large documents (Phase 3 needed for capture optimization)
+- Capture remains slow for large documents (Phase 4 needed for capture optimization)
 
 **Metrics to Track:**
-- Blob hit rate (target: >80% of queries within 1 month of deployment)
+- Storage type distribution (target: ~95% inline, ~5% blob)
+- Blob usage growth (documents >= 5 MB)
 - Legacy reconstruction calls (should decrease as new data arrives)
-- Query response time distribution (new vs old data)
+- Query response time distribution (inline vs blob vs legacy)
 
 ---
 
 ### Optional Phase 3 — Backfill Existing Data
 
+**Only applicable for Phase 2B (Hybrid Storage).** Not needed for Phase 2A (Redis Cache).
+
 **Only pursue if:** Performance consistency needed for historical queries or legacy code retirement desired.
 
 **Changes**
-- Background job reconstructs XML from existing Field entities
-- Writes blobs to FILESTREAM for events where EventBlobId IS NULL
+- Background job reconstructs complete documents from existing Field entities
+- Writes to SerializedDocument JSON column or Azure Blob Storage (based on size threshold)
 - Can prioritize hot data (recently queried) over cold data
 - Enables retirement of legacy reconstruction code once complete
 
@@ -334,12 +406,13 @@ Remove XML reconstruction from the query hot path.
 #### **Option 1: Full Backfill**
 ```
 Migration Job (low priority, background):
-1. SELECT EventId FROM Event WHERE EventBlobId IS NULL
-2. For each event:
-   - Reconstruct XML from Field entities (using current formatters)
-   - Write to FILESTREAM
-   - Update Event.EventBlobId
-3. Run continuously until all events backfilled
+1. SELECT RequestId FROM Request WHERE StorageType IS NULL
+2. For each request:
+   - Reconstruct complete document from Field entities (using current formatters)
+   - Check document size
+   - If < 5 MB: Write to SerializedDocument column, set StorageType=Inline
+   - If >= 5 MB: Write to Azure Blob Storage, set DocumentBlobUri, set StorageType=BlobStorage
+3. Run continuously until all requests backfilled
 ```
 
 **Pros:**
@@ -348,8 +421,8 @@ Migration Job (low priority, background):
 - Complete migration
 
 **Cons:**
-- Backfill could take days/weeks (millions of events)
-- Requires reconstructing XML
+- Backfill could take days/weeks (millions of requests)
+- Requires reconstructing complete documents
 - Database load during backfill
 
 **Timeline:** 2-4 weeks to implement job, 1-6 months to complete backfill (depends on data volume)
@@ -381,21 +454,21 @@ Migration Strategy:
 #### **Option 3: Cutover Date (No Backfill)**
 ```
 Query Logic:
-- Events where RecordTime < Phase2DeploymentDate: Use legacy reconstruction
-- Events where RecordTime >= Phase2DeploymentDate: Use FILESTREAM blobs
+- Requests where RecordTime < Phase2DeploymentDate: Use legacy reconstruction
+- Requests where RecordTime >= Phase2DeploymentDate: Use stored documents (inline or blob)
 ```
 
 **Pros:**
 - No backfill work needed
 - Predictable performance (date-based)
-- Simpler implementation (no blob existence check)
+- Simpler implementation (no StorageType check)
 
 **Cons:**
 - Historical data never benefits from optimization
 - Must maintain two code paths indefinitely
 - Performance cliff at cutover date
 
-**Timeline:** None (use dual-read date check instead of blob existence check)
+**Timeline:** None (use dual-read date check instead of StorageType check)
 
 ---
 
@@ -406,17 +479,17 @@ Query Logic:
 
 **Operational Cost**
 - Database load during backfill (CPU + I/O for reconstruction)
-- Storage: +200-300% for backfilled data
+- Storage: Estimated +45% for backfilled data (blended average: 95% inline, 5% blob)
 - 1-6 months of backfill runtime (depends on data volume and strategy)
 
 **Trade-offs if stopping here**
-- Requires reconstructing XML (ironic - the thing we're avoiding in queries)
+- Requires reconstructing complete documents (ironic - the thing we're avoiding in queries)
 - Database load during migration
 - Can be skipped if dual-read performance is acceptable
 
 **Metrics to Track:**
-- Backfill progress (events migrated per day)
-- Blob hit rate (should approach 100% as backfill progresses)
+- Backfill progress (requests migrated per day)
+- Storage type distribution (should approach ~95% inline, ~5% blob)
 - Legacy reconstruction calls (should trend to zero)
 
 ---
@@ -474,27 +547,28 @@ For HTTP timeout prevention, an optional asynchronous capture endpoint can be ad
 
 ## Operational Cost Considerations
 
-| Dimension | Phase 1 (Current) | Phase 2 (FILESTREAM) | Change |
-|-----------|-------------------|----------------------|---------|
-| **Storage** | SQL tables only | SQL tables + FILESTREAM (per-event + per-capture blobs) | +200-300% |
-| **Disk I/O** | Heavy (complex joins, field reconstruction) | Light (streaming blob reads) | -40-60% |
-| **Backup** | SQL backup | SQL backup (includes FILESTREAM automatically) | No change in process |
-| **Monitoring** | SQL Server only | SQL Server + FILESTREAM disk usage | +10-15% complexity |
-| **Platform** | SQL Server | SQL Server (no new tech) | No change |
-| **Scalability** | Limited (memory-bound queries) | Improved (streaming, horizontal scale) | Significant gain |
+| Dimension | Phase 1 (Current) | Phase 2B-Azure (Hybrid Storage) | Change |
+|-----------|-------------------|--------------------------------|---------|
+| **Storage** | SQL tables only | SQL tables + JSON columns + Azure Blob Storage | Est. +45% (blended) |
+| **Disk I/O** | Heavy (complex joins, field reconstruction) | Light (JSON column reads or blob streaming) | -40-60% |
+| **Backup** | Azure SQL backup | Azure SQL backup + Azure Blob Storage backup | Minimal added complexity |
+| **Monitoring** | Azure SQL only | Azure SQL + Blob Storage metrics | +10-15% complexity |
+| **Platform** | Azure SQL Database (PaaS) | Azure SQL Database + Azure Blob Storage (PaaS) | No IaaS overhead |
+| **Scalability** | Limited (memory-bound queries) | Improved (handles 20K events, horizontal scale) | Significant gain |
 
-**Storage Cost Breakdown (20,000 events/capture):**
-- Normalized SQL: ~50 MB (Event rows, indexes)
-- Per-event blobs: ~200 MB compressed (20,000 × 10 KB avg)
-- Per-capture blob: ~150 MB compressed (single document)
-- **Total: ~400 MB per capture** (vs. 50 MB current)
+### Cost Summary (Example Workload)
 
-**Cost Justification:**
-- Storage: Cheap ($0.02-0.10/GB/month for SQL Server storage)
-- Performance: +300-500% improvement in critical paths
-- Operational: Simpler than external blob storage (single platform, single backup)
+**Assumed workload:**
+- 1,000 captures/month
+- 5% of captures >= 5 MB (intelligent routing to blob)
+- Azure SQL Database S3 tier (100 DTUs)
 
-The Hybrid model with FILESTREAM trades **storage cost** for **performance and operational simplicity**.
+**Estimated monthly cost (West Europe):**
+- Azure SQL Database S3: ~€300/month
+- Azure Blob Storage: ~€0.03/month (negligible)
+- **Total: ~€300/month**
+
+The Hybrid model with intelligent routing trades **modest storage cost** for **performance and Azure PaaS simplicity**.
 
 ---
 
@@ -504,11 +578,55 @@ The following areas have been intentionally left open at this stage.
 They represent **known architectural decision points** that should be resolved based on
 operational constraints, observed usage patterns, and compliance requirements.
 
-### Storage Strategy (Phase 2)
-- **Resolved:** Use SQL Server FILESTREAM for transactional consistency
-- FILESTREAM participates in SQL transactions (atomic commit of SQL + blobs)
-- No distributed transaction complexity or reconciliation jobs needed
-- Single backup strategy (SQL backup includes FILESTREAM)
+### Question 1: Document Size Distribution Analysis
+- **Question:** What percentage of captures are >5 MB, >10 MB, >50 MB, >100 MB?
+- **Impact:** Determines whether to use intelligent routing (Hybrid Storage) or blob-only storage (simpler)
+- **Data Needed:**
+  - Histogram of capture sizes over representative workload (1,000+ captures)
+  - P50, P90, P95, P99 percentiles
+- **Recommendation:** **MANDATORY Phase 1 Gate 2 validation** - Must be measured before Phase 2 decision
+- **Status:** ✅ **Moved to Phase 1 validation** (Gate 2: Document Size Distribution Analysis)
+- **Decision Tree:**
+  - High proportion small docs (>80% <5MB) → Phase 2B-Azure (Hybrid Storage with intelligent routing)
+  - High proportion large docs (>50% >=5MB) → Phase 2B-Azure-Simple (Blob-Only Storage, simpler)
+  - Mixed distribution → Tune threshold or choose based on operational preference
+
+### Question 2: Query Pattern Analysis
+- **Question:** Are queries predominantly repetitive (dashboards, compliance) or unique (ad-hoc exploration)?
+- **Impact:** Determines whether Redis Cache (Phase 2A) or Hybrid Storage (Phase 2B) provides better ROI
+- **Data Needed:**
+  - Query logs for last 3-6 months
+  - Unique query patterns vs. total queries ratio
+  - Top 10 most frequent queries
+- **Recommendation:** Measure during Phase 1 validation to inform Phase 2 decision
+- **Expected Finding:** Mix of both patterns → Phase 2B (Hybrid Storage) recommended
+
+### Question 3: Multi-Region Deployment
+- **Question:** Is global distribution needed, or is single-region deployment acceptable?
+- **Impact:** Affects blob storage replication strategy
+- **Options:**
+  - **Single region:** Azure Blob Storage GRS (Geo-Redundant Storage) sufficient
+  - **Multi-region:** Consider Azure Front Door + CDN for edge caching
+- **Recommendation:** Start single-region, add multi-region if needed
+- **Status:** Deferred to Phase 2 implementation
+
+### Question 4: Compliance and Data Retention
+- **Question:** Are there data retention requirements (e.g., 7+ years for regulatory compliance)?
+- **Impact:** Long retention enables Azure Blob Archive tier cost optimization
+- **Options:**
+  - Long retention: Azure Blob Archive tier (€0.0018/GB) can reduce costs 90%
+  - Lifecycle policies can automatically tier cold data (e.g., >180 days → Archive)
+- **Recommendation:** Implement blob lifecycle policies for cost optimization
+- **Status:** Deferred to Phase 2 implementation
+
+### Question 5: Storage Strategy Consistency Requirements
+- **Question:** How critical is atomic consistency between SQL metadata and blob storage?
+- **Context:** Azure Blob Storage does not support distributed transactions with Azure SQL Database
+- **Options:**
+  - **Strong consistency:** Two-phase commit with compensation logic (+2-3 weeks implementation)
+  - **Eventual consistency:** Simple write-ahead pattern (acceptable for EPCIS workloads)
+- **Recommendation:** Eventual consistency with compensation logic is sufficient
+- **Status:** Resolved - Implement two-phase commit with compensation logic for Phase 2B
 
 ### Phase 4 Streaming Ingestion Validation Strategy
 - Schema validation approach when using streaming XML parsing (`XmlReader` with schema validation)
@@ -516,9 +634,10 @@ operational constraints, observed usage patterns, and compliance requirements.
 - Performance impact of schema-validating reader vs. DOM validation
 
 ### Cosmos DB Migration Trigger Criteria
-- At what scale does SQL Server FILESTREAM become insufficient? (>10M captures/month? >100 TB?)
-- Cost/benefit analysis: SQL licensing vs. Cosmos DB RU costs
+- At what scale does Azure SQL Database + Hybrid Storage become insufficient? (>10M captures/month? >100 TB?)
+- Cost/benefit analysis: Azure SQL Database vs. Cosmos DB RU costs
 - Query pattern analysis: When do document queries dominate over relational joins?
+- **Note:** Cosmos DB has 2 MB document size limit, making it unsuitable for 20,000-event documents without chunking
 
 ### MasterData Queries
 - **Status:** Out of scope for this document
@@ -548,12 +667,12 @@ the phased migration strategy described in this document.
 
 After Phase 1 benchmarking, choose one of three paths:
 
-#### **Path A: Azure Redis Cache** (Recommended for most deployments)
-- **Timeline:** 2-3 weeks
+#### **Path A: Azure Redis Cache** (For highly repetitive query patterns)
+- **Timeline:** 2-3 weeks implementation, 4-6 weeks total
 - **Use if:**
   - ✅ Repetitive query patterns (cache hit rate >50%)
   - ✅ Want operational simplicity (no schema changes)
-  - ✅ Budget allows Azure Redis (~$50-200/month)
+  - ✅ Budget allows Azure Redis (€55-110/month)
 - **Benefits:**
   - Near-zero latency for cache hits (1-5 ms)
   - No storage overhead
@@ -561,35 +680,38 @@ After Phase 1 benchmarking, choose one of three paths:
 - **Trade-offs:**
   - Eventually consistent (1-15 min TTL)
   - Cache misses same as current performance
-  - Operational cost (Azure Redis pricing)
+  - Operational cost (€355-455/month total with Azure SQL)
 
-#### **Path B: SQL Server FILESTREAM Blob Storage** (For high consistency needs)
-- **Timeline:** 6-10 weeks
+#### **Path B-Azure: Hybrid Storage (JSON Columns + Blob Storage)** (Recommended)
+- **Timeline:** 6-10 weeks implementation, 8-13 weeks total
 - **Use if:**
-  - ✅ Need strong consistency (transactional blob + SQL)
-  - ✅ Very large documents (>100 MB)
+  - ✅ Azure PaaS deployment (cost-effective)
+  - ✅ Need to support 20,000 event documents (20-100 MB)
   - ✅ Unpredictable query patterns (low cache hit rate)
+  - ✅ Want Azure PaaS simplicity (no IaaS VM management)
 - **Benefits:**
-  - 90% query improvement for all queries (not just cache hits)
-  - Transactional consistency (atomic blob + SQL commits)
-  - Lower long-term storage cost vs Redis
+  - Estimated 90% query improvement for all queries (not just cache hits)
+  - Handles typical documents efficiently (95% inline, fast)
+  - Handles 20K event edge cases (5% blob routing, automatic)
+  - Eventual consistency with compensation logic
+  - Lower total cost (€300-410/month)
 - **Trade-offs:**
-  - +200-300% storage overhead (dual blobs)
-  - Complex implementation (migrations, dual-read logic)
+  - Estimated +45% storage overhead (blended average)
+  - Complex implementation (migrations, dual-read logic, blob management)
 
-#### **Path C: Hybrid (Redis + Blob Storage)** (For high-scale SQL Server deployments)
-- **Timeline:** 8-13 weeks (Redis first, then blobs)
+#### **Path C-Azure: Hybrid Storage + Redis** (For high-scale Azure deployments)
+- **Timeline:** 8-13 weeks implementation, 10-16 weeks total
 - **Use if:**
-  - ✅ SQL Server with very high query volume
+  - ✅ Azure PaaS with very high query volume
   - ✅ Need best possible performance
   - ✅ Can manage increased operational complexity
-  - ✅ Budget allows both Redis + storage overhead
+  - ✅ Budget allows both Redis + storage overhead (€355-465/month)
 - **Benefits:**
-  - Best of both: cache hot data, blobs for consistency
-  - 1-5 ms for cache hits, 90% improvement for cache misses
+  - Best of both: cache hot data, stored documents for consistency
+  - 1-5 ms for cache hits, estimated 90% improvement for cache misses
 - **Trade-offs:**
   - Highest operational complexity
-  - Highest cost (Redis + storage)
+  - Highest cost (€355-465/month)
 
 ---
 
@@ -615,18 +737,22 @@ After Phase 1 benchmarking, choose one of three paths:
 
 | Scenario | Recommended Path | Timeline |
 |----------|-----------------|----------|
-| Repetitive query patterns | **Path A (Redis Cache)** | 4-6 weeks total |
-| Unpredictable query patterns | **Path B (Blob Storage)** | 8-13 weeks total |
-| Very high query volume | **Path C (Hybrid)** | 10-16 weeks total |
+| Need 20K events support, cost-effective | **Path B-Azure (Hybrid Storage)** ⭐ | 8-13 weeks total |
+| Repetitive query patterns, budget allows | **Path A (Redis Cache)** | 4-6 weeks total |
+| Very high query volume, budget allows | **Path C-Azure (Hybrid + Redis)** | 10-16 weeks total |
 | Budget-constrained | **Phase 1 only** (40-60% improvement) | 2-3 weeks |
 
-**Recommendation for Most Users:**
+**Recommendation for Azure PaaS Deployments:**
 1. **Phase 1** (2-3 weeks) - Algorithmic fixes + indexing
-2. **Benchmark** (1 week) - Measure serialization vs SQL, estimate cache hit rate
-3. **Phase 2A (Redis Cache)** (2-3 weeks) - If cache hit rate >50%
-4. **Evaluate:** If Redis insufficient, add Phase 2B (blob storage) later
+2. **Benchmark** (1 week) - Measure serialization vs SQL, document size distribution
+3. **Phase 2B-Azure (Hybrid Storage)** (6-10 weeks) - Handles 20K events, €300-410/month
+4. **Evaluate:** If query volume increases significantly, add Phase 2A (Redis) later for Phase 2C
 
-This incremental approach minimizes risk and delivers value faster (4-6 weeks vs 8-13 weeks for blob storage).
+**Expected Path:** Phase 1 → Phase 2B-Azure (Hybrid Storage) based on:
+- Cost-effective Azure PaaS deployment
+- 20,000 event support requirement
+- Azure PaaS deployment preference
+- Expected serialization bottleneck (60-80% of query time)
 
 ---
 
@@ -651,7 +777,7 @@ This document:
 
 ## Related Documents
 
-- [Executive Summary (Short Version)](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md) *(2-page decision-maker version)*
-- [Technical Appendix](EPCIS_Performance_Architecture_Executive_Summary.md) *(Extended summary)*
+- [Executive Summary](EPCIS_Performance_Architecture_Executive_Summary.md)
 - [Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) *(Historical: alternatives considered)*
 - [Performance Test Validation Strategy](Performance_Test_Validation_Strategy.md) *(How to validate improvements)*
+- [Azure Cost Assumptions (West Europe)](EPCIS_Azure_Cost_Assumptions.md) *(Detailed cost breakdowns and estimation worksheet)*

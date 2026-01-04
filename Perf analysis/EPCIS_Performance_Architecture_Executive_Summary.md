@@ -1,9 +1,28 @@
 
-# EPCIS Performance Architecture — Technical Appendix
+# EPCIS Performance Architecture — Executive Summary
 
-> **Note:** For a 2-page executive summary, see [EPCIS_Performance_Architecture_Executive_Summary_SHORT.md](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md)
+> **Performance Estimate Disclaimer**
 >
-> This document provides extended technical details for stakeholders who need implementation specifics.
+> Performance improvements in this document (e.g., "40-60% improvement," "90% reduction")
+> are **estimates** based on architectural analysis and preliminary profiling.
+>
+> Actual results will vary based on:
+> - Event complexity (custom fields, ILMD depth, extension usage)
+> - Workload characteristics (query patterns, capture frequency, document size distribution)
+> - Infrastructure configuration (Azure region, tier selection, network latency)
+>
+> Phase 1 validation will establish concrete baseline metrics using the
+> FasTnT.PerformanceTests benchmark suite.
+
+> **Cost Estimation Disclaimer**
+>
+> Cost estimates in this document are **examples** based on:
+> - West Europe region pricing (January 2025)
+> - Azure SQL Database S3 tier (€300-400/month)
+> - Azure Redis Cache C2 tier (€55/month)
+> - Azure Blob Storage (€0-20/month depending on volume)
+>
+> **Your actual costs will vary.** See [Azure Cost Assumptions (West Europe)](EPCIS_Azure_Cost_Assumptions.md) for detailed pricing and calculation worksheet.
 
 ## Background
 
@@ -40,13 +59,20 @@ The recommended approach provides **three architecture options**, chosen based o
 - Choose if: SQL query execution is the bottleneck (>40% of query time)
 - Benefit: Near-zero latency for cache hits (1-5 ms)
 
-**Option B: SQL Server FILESTREAM Blob Storage**
-- Dual-granularity blob storage (per-event + per-capture)
+**Option B-Azure: Hybrid Storage (JSON Columns + Blob Storage)**
+- Intelligent routing based on document size (configurable 5 MB threshold)
+- Small documents (< 5 MB): JSON column in Azure SQL Database
+- Large documents (>= 5 MB): Azure Blob Storage
 - Choose if: Serialization is the bottleneck (60-80% of query time)
-- Benefit: Eliminates XML reconstruction (90% improvement)
+- Benefit: **Estimated** 90% reduction in serialization for blob-stored documents
 
-**Option C: Hybrid (Both A + B)**
-- Combines Redis cache + FILESTREAM blob storage
+**Why 5 MB threshold:**
+- Documents < 5 MB: Acceptable performance in JSON column (minor overhead)
+- Documents >= 5 MB: Trigger significant performance degradation in SQL (slower deserialization, higher memory usage)
+- 5 MB ≈ 1,000-5,000 events (typical large captures stay inline, only extreme cases go to blob)
+
+**Option C-Azure: Hybrid Storage + Redis**
+- Combines Redis cache + Hybrid Storage (JSON + Blob)
 - Choose if: Both bottlenecks are significant
 - Benefit: Best of both approaches
 
@@ -65,18 +91,21 @@ Key principles:
 **Option A - Redis Cache:**
 - **Query performance:** Near-zero latency on cache hits (1-5 ms vs 500-2000 ms)
 - **Implementation:** Simple (2-3 weeks)
-- **Trade-off:** Cache miss = baseline performance, operational cost
+- **Cost:** SQL (€300-400) + Redis (€55) = **€355-455/month**
+- **Trade-off:** Cache miss = baseline performance
 
-**Option B - Blob Storage:**
-- **Query performance:** ~90% reduction in serialization cost (for new data)
-- **Query memory:** ~70-80% reduction in query-time memory usage (for new data)
-- **Flexibility:** Full EPCIS payloads retained for compliance
-- **Trade-off:** +200-300% storage for new data
+**Option B-Azure - Hybrid Storage:**
+- **Query performance:** **Estimated** ~90% reduction in serialization cost (for blob-stored documents)
+- **Query memory:** **Estimated** ~70-80% reduction in query-time memory usage (for blob-stored documents)
+- **Flexibility:** Handles typical documents efficiently (inline), supports 20K event edge cases (blob routing)
+- **Cost:** SQL (€300-400) + Blob (€0-10) = **€300-410/month**
+- **Trade-off:** **Estimated** +45% storage (blended average: most docs inline, minimal blob usage)
 
-**Option C - Hybrid:**
-- **Query performance:** 1-5 ms on cache hits, 90% improvement on cache misses
+**Option C-Azure - Hybrid Storage + Redis:**
+- **Query performance:** 1-5 ms on cache hits, **estimated** 90% improvement on cache misses
 - **Best of both:** Combines all benefits
-- **Trade-off:** Higher complexity, both operational costs
+- **Cost:** SQL (€300-400) + Blob (€0-10) + Redis (€55) = **€355-465/month**
+- **Trade-off:** Higher complexity
 
 **Phase 3 (Optional - Historical Data Backfill):**
 - **Uniform performance:** All data (old and new) benefits from blob optimization
@@ -109,18 +138,18 @@ The strategy is deliberately phased to allow early value and controlled adoption
 - **Trade-off:** Cache miss = baseline, operational cost
 - See Hybrid Phasing document Phase 2A for details
 
-**Phase 2B — Blob-Based Response Path (6-10 weeks)** - Choose if serialization is bottleneck
-- Store XML in SQL Server FILESTREAM (per-event + per-capture blobs)
+**Phase 2B — Hybrid Storage (6-10 weeks)** - Choose if serialization is bottleneck
+- Intelligent routing: Small documents (< 5 MB) to JSON column, large documents (>= 5 MB) to Azure Blob Storage
 - Keep all existing SQL normalization (full query flexibility)
-- **Deploy with dual-read mode:** New data uses blobs, existing data uses legacy reconstruction
-- **Benefits:** ~90% query serialization reduction, ~70-80% memory reduction (new data only)
-- **Trade-off:** No capture improvement, +200-300% storage for new data
-- See Hybrid Phasing document Phase 2 for detailed implementation strategy
+- **Deploy with dual-path logic:** Route based on document size, handle both storage types in queries
+- **Benefits:** **Estimated** ~90% query serialization reduction (blob-stored documents), **estimated** ~70-80% memory reduction
+- **Trade-off:** No capture improvement, **estimated** +45% storage (blended average)
+- See Hybrid Phasing document Phase 2B for detailed implementation strategy
 
-**Phase 2C — Hybrid (Both)** - Choose if both bottlenecks significant
-- Combine Redis cache + FILESTREAM blob storage
-- Best performance: cache hits 1-5 ms, cache misses 90% faster
-- Higher complexity and operational cost
+**Phase 2C — Hybrid Storage + Redis** - Choose if both bottlenecks significant
+- Combine Redis cache + Hybrid Storage (JSON columns + Blob Storage)
+- Best performance: cache hits 1-5 ms, cache misses **estimated** 90% faster
+- Higher complexity and operational cost (€355-465/month)
 
 ### Optional Phase 3 — Backfill Existing Data (1-6 months) - Only for Phase 2B/2C
 - Background job writes blobs for existing data
@@ -154,24 +183,28 @@ For HTTP timeout prevention, an optional async endpoint can be added:
 
 ---
 
-## Storage Strategy: SQL Server FILESTREAM
+## Azure Cost Analysis (Estimated)
 
-**Why FILESTREAM?**
-- Transactional consistency (ACID guarantees, no distributed transactions)
-- Stores blobs on NTFS filesystem, managed by SQL Server
-- Single backup strategy (SQL backup includes FILESTREAM)
-- Proven at scale (supports 2 GB blobs, multi-TB databases)
+| Option | Monthly Cost Calculation | Total (EUR) | Best For |
+|--------|-------------------------|-------------|----------|
+| **Option A:** Redis Cache | SQL (€300-400) + Redis (€55) | **€355-455** | Repetitive queries (>40% cache hit rate) |
+| **Option B-Azure:** Hybrid Storage | SQL (€300-400) + Blob (€0-10) | **€300-410** | Mixed document sizes, unpredictable queries |
+| **Option C-Azure:** Hybrid + Redis | SQL (€300-400) + Blob (€0-10) + Redis (€55) | **€355-465** | Very high query volume, mixed patterns |
 
-**Cost Impact:**
-- Storage: +200-300% for new data (dual blobs: per-event + per-capture)
-- Operational complexity: +10-15%
-- Performance: +300-500% improvement for queries
+**Component Breakdown:**
+- Azure SQL Database S3 (100 DTU): €300-400/month
+- Azure Blob Storage (hybrid, 5-15% large docs): €0-10/month
+- Azure Redis Cache C2 (2.5 GB): €55/month
+
+**Note:** Blob storage cost is negligible for typical workloads where 95% of documents < 5 MB.
+
+With lifecycle policies (archive after 180 days), long-term storage costs can be reduced 80-90%.
 
 ---
 
 ## Future Consideration: Cosmos DB
 
-**Keep SQL Server FILESTREAM unless:**
+**Keep Azure SQL Database + Hybrid Storage unless:**
 - Volume exceeds >10M captures/month, >100 TB storage
 - Multi-region active-active replication required
 - Query patterns shift from relational to document-centric
@@ -235,7 +268,7 @@ Use this matrix to determine optimal stopping point:
 
 ## Related Documents
 
-- [Executive Summary (Short Version)](EPCIS_Performance_Architecture_Executive_Summary_SHORT.md) *(2-page decision-maker version)*
 - [EPCIS Performance Architecture – Hybrid Strategy & Phased Migration](EPCIS_Performance_Architecture_Hybrid_Phasing.md) *(Full technical specification)*
 - [EPCIS Architectural Decision Record](EPCIS_Architectural_Decision_Record.md) *(Historical: alternatives considered)*
 - [Performance Test Validation Strategy](Performance_Test_Validation_Strategy.md) *(Validation approach using FasTnT.PerformanceTests)*
+- [Azure Cost Assumptions (West Europe)](EPCIS_Azure_Cost_Assumptions.md) *(Detailed cost breakdowns and estimation worksheet)*

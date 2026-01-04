@@ -1,5 +1,12 @@
 # FasTnT.PerformanceTests - Validation Strategy for Phased Migration
 
+> **Performance Estimate Disclaimer**
+>
+> Performance improvements in this document (e.g., "40-60% improvement," "90% reduction")
+> are **estimates** based on architectural analysis and preliminary profiling.
+> Actual results will vary based on event complexity, workload characteristics, and infrastructure configuration.
+> This validation strategy defines how to establish concrete baseline metrics and measure actual improvements.
+
 > **Purpose:** This document describes how to use the existing FasTnT.PerformanceTests project to validate Phase 1 and Phase 2 performance improvements.
 
 ---
@@ -85,9 +92,9 @@ dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters js
 - [ ] No functional regressions (all tests pass)
 - **Decision:** If passed → Proceed to Phase 1 Bottleneck Analysis
 
-#### Step 5: Phase 1 Bottleneck Analysis (NEW)
+#### Step 5: Phase 1 Gate 1 - Bottleneck Analysis (MANDATORY)
 
-**Goal:** Determine which Phase 2 option to pursue
+**Goal:** Determine whether SQL query or serialization is the dominant bottleneck
 
 **Add new benchmark to measure time breakdown:**
 ```csharp
@@ -115,12 +122,111 @@ public QueryResponse ExecuteFullQueryPipeline()
 }
 ```
 
-**Decision Criteria:**
-- **If Serialization 60-80%** → Phase 2B (Blob Storage) - Eliminates serialization bottleneck
+**Gate 1 Decision Criteria:**
 - **If SQL Query >40%** → Phase 2A (Redis Cache) - Bypasses SQL on cache hits
-- **If Both high** → Phase 2C (Hybrid) - Best of both approaches
+- **If Serialization 60-80%** → Proceed to Gate 2 (document size distribution)
+- **If Both high** → Phase 2C-Azure (Hybrid Storage + Redis) - Best of both approaches
 
-**Expected Finding:** Serialization is 60-80% of query time → Phase 2B recommended
+**Expected Finding:** Serialization is 60-80% of query time → Proceed to Gate 2
+
+---
+
+#### Step 6: Phase 1 Gate 2 - Document Size Distribution Analysis (MANDATORY)
+
+**Goal:** Determine whether intelligent routing (Hybrid Storage) or blob-only storage is appropriate
+
+**Only execute if Gate 1 shows serialization is the bottleneck (60-80%)**
+
+**Add benchmark to analyze document size distribution:**
+```csharp
+// In new DocumentSizeDistributionBenchmarks.cs
+
+[Benchmark]
+public void AnalyzeDocumentSizeDistribution()
+{
+    // Capture 1,000+ documents with realistic event counts
+    var eventCounts = TestDataGenerator.GenerateRealisticEventCounts(1000);
+
+    var sizeDistribution = new Dictionary<string, int>
+    {
+        { "<1MB", 0 },
+        { "1-5MB", 0 },
+        { "5-10MB", 0 },
+        { "10-50MB", 0 },
+        { ">50MB", 0 }
+    };
+
+    long totalSize = 0;
+    var sizes = new List<double>();
+
+    foreach (var count in eventCounts)
+    {
+        var document = TestDataGenerator.GenerateEpcisDocument(count);
+        var sizeBytes = CalculateSize(document);
+        var sizeMB = sizeBytes / (1024.0 * 1024.0);
+
+        totalSize += sizeBytes;
+        sizes.Add(sizeMB);
+
+        if (sizeMB < 1) sizeDistribution["<1MB"]++;
+        else if (sizeMB < 5) sizeDistribution["1-5MB"]++;
+        else if (sizeMB < 10) sizeDistribution["5-10MB"]++;
+        else if (sizeMB < 50) sizeDistribution["10-50MB"]++;
+        else sizeDistribution[">50MB"]++;
+    }
+
+    // Calculate percentiles
+    sizes.Sort();
+    var p50 = sizes[(int)(sizes.Count * 0.50)];
+    var p90 = sizes[(int)(sizes.Count * 0.90)];
+    var p95 = sizes[(int)(sizes.Count * 0.95)];
+    var p99 = sizes[(int)(sizes.Count * 0.99)];
+
+    Console.WriteLine("Document Size Distribution:");
+    foreach (var kvp in sizeDistribution)
+    {
+        Console.WriteLine($"{kvp.Key}: {kvp.Value / 1000.0:P1}");
+    }
+    Console.WriteLine($"\nPercentiles:");
+    Console.WriteLine($"P50: {p50:F2} MB");
+    Console.WriteLine($"P90: {p90:F2} MB");
+    Console.WriteLine($"P95: {p95:F2} MB");
+    Console.WriteLine($"P99: {p99:F2} MB");
+
+    var smallDocsPercent = (sizeDistribution["<1MB"] + sizeDistribution["1-5MB"]) / 1000.0;
+    var largeDocsPercent = (sizeDistribution["5-10MB"] + sizeDistribution["10-50MB"] + sizeDistribution[">50MB"]) / 1000.0;
+
+    Console.WriteLine($"\n**Phase 2 Decision:**");
+    if (smallDocsPercent > 0.80)
+    {
+        Console.WriteLine($"→ Phase 2B-Azure (Hybrid Storage with intelligent routing)");
+        Console.WriteLine($"  Reason: {smallDocsPercent:P0} of documents < 5 MB (most stay inline, fast)");
+    }
+    else if (largeDocsPercent > 0.50)
+    {
+        Console.WriteLine($"→ Phase 2B-Azure-Simple (Blob-Only Storage)");
+        Console.WriteLine($"  Reason: {largeDocsPercent:P0} of documents >= 5 MB (simpler to route all to blob)");
+    }
+    else
+    {
+        Console.WriteLine($"→ Mixed distribution - Recommend tuning threshold or operational preference");
+        Console.WriteLine($"  Small (<5MB): {smallDocsPercent:P0}, Large (>=5MB): {largeDocsPercent:P0}");
+    }
+}
+```
+
+**Gate 2 Decision Criteria:**
+- **If >80% of documents < 5 MB** → Phase 2B-Azure (Hybrid Storage with intelligent routing)
+  - Most documents stay inline (fast SQL access, no network call)
+  - Large documents routed to blob (handles edge cases like 20K events)
+  - Trade-off: Dual code paths for inline vs blob retrieval
+- **If >50% of documents >= 5 MB** → Phase 2B-Azure-Simple (Blob-Only Storage)
+  - Simpler implementation (single code path, all documents to blob)
+  - Avoids dual-path complexity
+  - Trade-off: Network call for all documents, even small ones
+- **If mixed distribution (40-80% < 5 MB)** → Tune threshold or choose based on operational preference
+
+**Expected Finding:** >80% of documents < 5 MB → Phase 2B-Azure (Hybrid Storage with 5 MB threshold)
 
 ---
 
@@ -182,31 +288,52 @@ public async Task<string> QueryWithCacheMiss()
 
 ---
 
-### Phase 2B Validation Strategy (Blob Storage)
+### Phase 2B-Azure Validation Strategy (Hybrid Storage: JSON Columns + Blob Storage)
 
-**Goal:** Validate **90% query serialization reduction, 70-80% memory reduction** from blob-based queries.
+**Goal:** Validate **estimated 90% query serialization reduction, estimated 70-80% memory reduction** from stored document queries.
 
-#### Required: Add Blob-Based Benchmark
+#### Required: Add Hybrid Storage Benchmarks
 
-Phase 2B introduces FILESTREAM blobs. The existing SerializationBenchmarks tests reconstruction-based serialization. Need to add blob-path benchmark.
+Phase 2B-Azure introduces intelligent routing:
+- Small documents (< 5 MB) → JSON column (SerializedDocument)
+- Large documents (>= 5 MB) → Azure Blob Storage (DocumentBlobUri)
+
+The existing SerializationBenchmarks tests reconstruction-based serialization. Need to add benchmarks for both storage paths.
 
 **Suggested Addition:**
 ```csharp
-// In SerializationBenchmarks.cs or new BlobSerializationBenchmarks.cs
+// In SerializationBenchmarks.cs or new HybridStorageBenchmarks.cs
 
 [Benchmark(Baseline = true)]
 public string SerializeFromFieldEntities()
 {
-    // Current path: reconstruct XML from Field entities
+    // Current path: reconstruct from Field entities
     var response = _standardResponses[ResultSize];
     return XmlQueryResponseFormatter.Format(response);
 }
 
 [Benchmark]
-public async Task<string> SerializeFromBlob()
+public async Task<string> SerializeFromJsonColumn()
 {
-    // Phase 2B path: fetch pre-stored XML from FILESTREAM
-    return await _blobStorage.FetchEventXmlAsync(eventIds);
+    // Phase 2B path: fetch pre-stored document from SerializedDocument column
+    // Inline storage (fast path, no external network call)
+    return await _context.Requests
+        .Where(r => r.Id == requestId && r.StorageType == StorageType.Inline)
+        .Select(r => r.SerializedDocument)
+        .FirstOrDefaultAsync();
+}
+
+[Benchmark]
+public async Task<string> SerializeFromAzureBlobStorage()
+{
+    // Phase 2B path: fetch pre-stored document from Azure Blob Storage
+    // External storage (network call, for large documents >= 5 MB)
+    var uri = await _context.Requests
+        .Where(r => r.Id == requestId && r.StorageType == StorageType.BlobStorage)
+        .Select(r => r.DocumentBlobUri)
+        .FirstOrDefaultAsync();
+
+    return await _azureBlobService.DownloadBlobAsync(uri);
 }
 ```
 
@@ -216,73 +343,93 @@ public async Task<string> SerializeFromBlob()
 
 Use Phase 1 results as baseline for Phase 2B comparison.
 
-**Step 2: Implement Phase 2B (Dual-Read Mode)**
+**Step 2: Implement Phase 2B-Azure (Dual-Read Mode)**
 
-1. Add FILESTREAM columns (EventBlobId, DocumentBlobId)
-2. Implement dual-read logic (check if blob exists → fetch blob OR reconstruct)
-3. New captures write blobs
+1. Add hybrid storage columns (SerializedDocument, DocumentBlobUri, StorageType)
+2. Implement dual-read logic:
+   ```
+   If StorageType == Inline: Fetch from SerializedDocument column
+   Else if StorageType == BlobStorage: Fetch from Azure Blob Storage via DocumentBlobUri
+   Else (NULL): Reconstruct from Field entities (legacy path)
+   ```
+3. New captures write to JSON column or blob based on size threshold (default 5 MB)
 
 **Step 3: Run Phase 2B Benchmarks**
 
 ```bash
-# Query against NEW data (with blobs)
-dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters json md --artifacts artifacts/phase2-new
+# Query against NEW data with inline storage (< 5 MB)
+dotnet run -c Release --filter *HybridStorageBenchmarks.SerializeFromJsonColumn* --memory --exporters json md --artifacts artifacts/phase2b-inline
 
-# Query against OLD data (without blobs, legacy path)
-dotnet run -c Release --filter *SerializationBenchmarks* --memory --exporters json md --artifacts artifacts/phase2-old
+# Query against NEW data with blob storage (>= 5 MB)
+dotnet run -c Release --filter *HybridStorageBenchmarks.SerializeFromAzureBlobStorage* --memory --exporters json md --artifacts artifacts/phase2b-blob
+
+# Query against OLD data (without stored documents, legacy path)
+dotnet run -c Release --filter *SerializationBenchmarks.SerializeFromFieldEntities* --memory --exporters json md --artifacts artifacts/phase2b-legacy
 ```
 
 **Step 4: Compare Results**
 
-**Success Criteria (New Data with Blobs):**
-- Serialization duration: ≥90% reduction vs Phase 1
-- Memory usage: 70-80% reduction vs Phase 1
+**Success Criteria (New Data - Inline Storage):**
+- Serialization duration: Estimated ≥90% reduction vs Phase 1
+- Memory usage: Estimated 70-80% reduction vs Phase 1
 - Query response time: < 2 seconds for 1,000 events
 
-**Expected (Old Data without Blobs):**
-- Performance similar to Phase 1 (legacy path)
+**Success Criteria (New Data - Blob Storage):**
+- Serialization duration: Estimated ≥90% reduction vs Phase 1 (after network latency)
+- Memory usage: Estimated 70-80% reduction vs Phase 1
+- Network latency: Measure and document baseline (Azure region-dependent)
+
+**Expected (Old Data without Stored Documents):**
+- Performance similar to Phase 1 (legacy reconstruction path)
 
 **Validation Gate:**
-- [ ] New data query performance ≥90% faster
-- [ ] New data memory usage 70-80% lower
+- [ ] Inline storage query performance estimated ≥90% faster
+- [ ] Blob storage query performance estimated ≥90% faster (excluding network latency)
+- [ ] Network latency baseline documented for Azure Blob Storage
+- [ ] Inline vs blob storage distribution matches expectations (~95% inline, ~5% blob)
 - [ ] Old data performance unchanged (dual-read works)
 - [ ] No functional regressions
 - **Decision:** Production deployment approved
 
 ---
 
-### Phase 2C Validation Strategy (Hybrid)
+### Phase 2C-Azure Validation Strategy (Hybrid Storage + Redis)
 
-**Goal:** Validate combined benefits of Redis cache + Blob storage
+**Goal:** Validate combined benefits of Redis cache + Hybrid Storage (JSON Columns + Azure Blob Storage)
 
-**Approach:** Run both Phase 2A and Phase 2B validation strategies
+**Approach:** Run both Phase 2A and Phase 2B-Azure validation strategies
 
 **Expected Results:**
 - Cache hit performance: 1-5 ms (Redis)
-- Cache miss performance (new data): 90% faster than Phase 1 (blobs)
+- Cache miss performance (new data, inline): Estimated 90% faster than Phase 1
+- Cache miss performance (new data, blob): Estimated 90% faster than Phase 1 (after network latency)
 - Cache miss performance (old data): Same as Phase 1 (reconstruction)
 
 **Validation Gate:**
 - [ ] All Phase 2A success criteria met
-- [ ] All Phase 2B success criteria met
-- [ ] No conflicts between Redis and blob storage
+- [ ] All Phase 2B-Azure success criteria met
+- [ ] No conflicts between Redis cache and hybrid storage
+- [ ] Cache invalidation works correctly when new data captured
 - **Decision:** Production deployment approved
 
 ---
 
 ## Recommended Benchmark Additions
 
-### 1. Large Document Benchmark
+### 1. Large Document Benchmark (20,000 Event Requirement)
 
-Current benchmarks use 100-500 events. Documentation mentions "100 MB document (5,000 events)."
+Current benchmarks use 100-500 events. Need to validate 20,000 event documents (20-100 MB).
 
 **Add to CaptureBenchmarks.cs:**
 ```csharp
-[Params(100, 500, 5000)]
+[Params(100, 500, 5000, 20000)]
 public int EventCount { get; set; }
 ```
 
-**Why:** Validate "~120s capture time for 100 MB" baseline claim.
+**Why:**
+- Validate capture performance for 20,000 event requirement
+- Confirm automatic blob routing for large documents (>= 5 MB threshold)
+- Measure actual document size at 20,000 events
 
 ### 2. Dense Custom Fields Benchmark
 
@@ -312,36 +459,155 @@ public string SerializeEventsWithDenseCustomFields()
 - Phase 0: Exponential slowdown as FieldsPerEvent increases
 - Phase 1: Linear scaling (O(n) after optimization)
 
+### 3. Threshold Boundary Testing (Phase 2B-Azure)
+
+Test documents around the 5 MB threshold to validate routing logic and performance crossover.
+
+**Add: ThresholdBoundaryBenchmarks.cs**
+```csharp
+[Params(4.5, 4.9, 5.0, 5.1, 10.0, 20.0)]
+public double DocumentSizeMB { get; set; }
+
+[Benchmark]
+public async Task CaptureAndQueryDocumentAtThreshold()
+{
+    // Generate document of specified size
+    var eventCount = CalculateEventCountForSize(DocumentSizeMB);
+    var document = TestDataGenerator.GenerateEpcisDocument(eventCount);
+
+    // Capture (should route to JSON column or blob based on size)
+    await _captureService.CaptureAsync(document);
+
+    // Query and measure performance
+    var result = await _queryService.GetEventsAsync(/* query params */);
+    return result;
+}
+```
+
+**Why:**
+- Validate 5 MB threshold routing works correctly
+- Identify performance crossover point (when blob storage becomes beneficial)
+- Confirm no performance cliff at threshold boundary
+- Validate that documents just under 5 MB go to JSON column
+- Validate that documents just over 5 MB go to Azure Blob Storage
+
+**Expected Results:**
+- Documents < 5 MB: Inline storage (fast, no network call)
+- Documents >= 5 MB: Blob storage (network call, but handles large docs)
+- No significant performance drop at 5 MB boundary
+
+### 4. Azure Blob Storage Network Latency Baseline (Phase 2B-Azure)
+
+Measure baseline network latency for Azure Blob Storage operations.
+
+**Add: AzureBlobLatencyBenchmarks.cs**
+```csharp
+[Benchmark]
+public async Task MeasureBlobUploadLatency()
+{
+    // Measure time to upload blob to Azure Storage
+    var document = TestDataGenerator.GenerateEpcisDocument(20000); // Large doc
+    var stopwatch = Stopwatch.StartNew();
+    var uri = await _azureBlobService.UploadBlobAsync(document);
+    stopwatch.Stop();
+
+    Console.WriteLine($"Blob upload latency: {stopwatch.ElapsedMilliseconds}ms");
+    return uri;
+}
+
+[Benchmark]
+public async Task MeasureBlobDownloadLatency()
+{
+    // Measure time to download blob from Azure Storage
+    var uri = await GetExistingBlobUri();
+    var stopwatch = Stopwatch.StartNew();
+    var document = await _azureBlobService.DownloadBlobAsync(uri);
+    stopwatch.Stop();
+
+    Console.WriteLine($"Blob download latency: {stopwatch.ElapsedMilliseconds}ms");
+    return document;
+}
+
+[Params(1, 5, 10, 20, 50, 100)]
+public int DocumentSizeMB { get; set; }
+
+[Benchmark]
+public async Task MeasureBlobLatencyBySize()
+{
+    // Measure network latency for different document sizes
+    var document = GenerateDocumentOfSize(DocumentSizeMB);
+    var stopwatch = Stopwatch.StartNew();
+
+    var uri = await _azureBlobService.UploadBlobAsync(document);
+    var downloaded = await _azureBlobService.DownloadBlobAsync(uri);
+
+    stopwatch.Stop();
+    Console.WriteLine($"Round-trip latency ({DocumentSizeMB}MB): {stopwatch.ElapsedMilliseconds}ms");
+    return downloaded;
+}
+```
+
+**Why:**
+- Establish baseline network latency for Azure Blob Storage in target Azure region
+- Understand latency overhead for blob-stored documents vs inline storage
+- Validate that blob storage is acceptable for large documents (trade latency for memory/CPU savings)
+- Measure round-trip time (upload + download) for cost/benefit analysis
+
+**Expected Results:**
+- Upload latency: 50-200 ms (Azure region-dependent)
+- Download latency: 30-150 ms (Azure region-dependent)
+- Round-trip latency scales with document size (network bandwidth)
+- Latency acceptable for large documents (edge case, 5% of workload)
+
+**Important:** Network latency will vary by:
+- Azure region (same-region = lower latency)
+- Network conditions
+- Blob storage tier (Hot, Cool, Archive)
+- Document size
+
+### 5. Document Size Distribution Analysis (MOVED TO PHASE 1 GATE 2)
+
+✅ **This benchmark is now MANDATORY for Phase 1 validation** - See "Step 6: Phase 1 Gate 2 - Document Size Distribution Analysis"
+
+This analysis determines whether to use intelligent routing (Hybrid Storage) or blob-only storage (simpler).
+
 ---
 
 ## Summary
 
-**Phase 1 Validation:**
+**Phase 1 Validation (Two-Stage Gating):**
 - Use existing CaptureBenchmarks and SerializationBenchmarks
-- Run before/after, compare 40-60% improvement
-- **NEW:** Add bottleneck analysis benchmark to measure serialization % vs SQL query %
-- **Requires ~2-3 hours** to add bottleneck analysis benchmark
+- Run before/after, compare estimated 40-60% improvement
+- **Gate 1 (MANDATORY):** Add bottleneck analysis benchmark to measure serialization % vs SQL query %
+- **Gate 2 (MANDATORY if serialization is bottleneck):** Add document size distribution analysis
+- **Requires ~4-5 hours** to add both gating benchmarks
 
 **Phase 2A Validation (Redis Cache):**
 - Need to add Redis cache benchmarks (cache hit, cache miss)
 - Compare cache hit vs baseline performance
 - **Requires ~2-3 hours** to add Redis cache benchmarks
 
-**Phase 2B Validation (Blob Storage):**
-- Need to add blob-path benchmarks
-- Compare blob vs reconstruction performance
-- **Requires ~2-3 hours** to add blob benchmarks
+**Phase 2B-Azure Validation (Hybrid Storage: JSON Columns + Blob Storage):**
+- Need to add hybrid storage benchmarks (inline + blob paths)
+- Need to add threshold boundary testing benchmarks
+- Need to add Azure Blob Storage network latency benchmarks
+- Need to add document size distribution analysis
+- Compare inline vs blob vs reconstruction performance
+- **Requires ~6-8 hours** to add all Phase 2B-Azure benchmarks
 
-**Phase 2C Validation (Hybrid):**
-- Run both Phase 2A and Phase 2B validation strategies
-- **Requires ~4-6 hours** (both benchmarks)
+**Phase 2C-Azure Validation (Hybrid Storage + Redis):**
+- Run both Phase 2A and Phase 2B-Azure validation strategies
+- **Requires ~8-11 hours** (both benchmark sets)
 
-**Total effort to make validation-ready:** ~6-8 hours
+**Total effort to make validation-ready:** ~12-16 hours
 - Add bottleneck analysis benchmark (2-3 hours)
 - Add FieldReconstructionBenchmarks.cs (1-2 hours)
 - Add Redis cache benchmarks for Phase 2A (2-3 hours)
-- Add blob-path benchmarks for Phase 2B (2-3 hours)
-- Update EventCount params to include 5000 (5 minutes)
+- Add HybridStorageBenchmarks.cs for Phase 2B-Azure (2-3 hours)
+- Add ThresholdBoundaryBenchmarks.cs (1-2 hours)
+- Add AzureBlobLatencyBenchmarks.cs (2-3 hours)
+- Add DocumentSizeDistributionBenchmarks.cs (1-2 hours)
+- Update EventCount params to include 20000 (5 minutes)
 
 ---
 
@@ -350,9 +616,26 @@ public string SerializeEventsWithDenseCustomFields()
 1. **Approve Phase 1 optimization approach**
 2. **Run Phase 0 baseline benchmarks** (save to artifacts/phase0)
 3. **Implement Phase 1 optimizations** (including database indexes, EF Core optimizations)
-4. **Run Phase 1 benchmarks, validate ≥40% improvement**
-5. **Run Phase 1 bottleneck analysis** - Determine serialization % vs SQL query %
-6. **Choose Phase 2 path** - Select 2A (Redis), 2B (Blob Storage), or 2C (Hybrid) based on bottleneck
-7. **Approve and implement selected Phase 2 option**
-8. **Run Phase 2 validation benchmarks for selected option**
-9. **Production deployment after validation gates pass**
+4. **Run Phase 1 benchmarks, validate estimated ≥40% improvement**
+5. **Run Phase 1 Gate 1: Bottleneck Analysis** - Determine serialization % vs SQL query %
+   - If SQL query >40% → Phase 2A (Redis Cache)
+   - If serialization 60-80% → Proceed to Gate 2
+   - If both high → Phase 2C-Azure (Hybrid + Redis)
+6. **Run Phase 1 Gate 2: Document Size Distribution** - Only if serialization is bottleneck
+   - If >80% documents < 5 MB → Phase 2B-Azure (Hybrid Storage with intelligent routing)
+   - If >50% documents >= 5 MB → Phase 2B-Azure-Simple (Blob-Only Storage, simpler)
+   - If mixed → Tune threshold or choose based on preference
+7. **Choose Phase 2 path** - Select based on two-stage Phase 1 validation:
+   - **2A (Redis Cache)** - If SQL query is bottleneck (>40%)
+   - **2B-Azure (Hybrid Storage)** - If serialization bottleneck + high proportion small docs **[Expected path]**
+   - **2B-Azure-Simple (Blob-Only)** - If serialization bottleneck + high proportion large docs
+   - **2C-Azure (Hybrid + Redis)** - If both bottlenecks significant
+8. **Approve and implement selected Phase 2 option**
+9. **Add Azure-specific benchmarks** (threshold boundary, network latency) for Phase 2B-Azure variants
+10. **Run Phase 2 validation benchmarks for selected option**
+11. **Production deployment after validation gates pass**
+
+**Expected Path:** Phase 1 → Gate 1 (serialization 60-80%) → Gate 2 (>80% < 5 MB) → Phase 2B-Azure (Hybrid Storage with intelligent routing) based on:
+- Cost-effective Azure PaaS deployment
+- 20,000 event support requirement
+- Expected document size distribution (95% < 5 MB)
